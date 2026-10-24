@@ -161,6 +161,17 @@ Response: the `physics` object above, minus `next_shot`, plus:
   an advice candidate). 409 if that shot isn't open from this layout, or the cue ball
   hasn't been seen
 
+`POST /plan` → physics only, no game: the best power and spin for one shot from any layout.
+No database or Gemini, so it also works for the frontend's dev test table. The app uses it
+for the spin indicator and power bar of whichever shot is selected.
+```json
+{"balls": [{"id": null, "type": "cue", "x": 250, "y": 250}, {"id": 12, "type": "stripe", "x": 380, "y": 140}],
+ "group": null, "target_id": 12, "pocket": "top_side", "kind": "direct", "cut_angle": 11}
+```
+Response: `{"physics": <the advice physics object, planned: true>, "speed": "medium", "spin_name": "follow"}`.
+`physics` (and the words) are null if no power and spin tried pockets the ball. 409 if
+there's no cue ball or that shot isn't open from this layout.
+
 ### Spin and power
 How the numbers map to the indicator (same in advice `physics` and `/simulate`):
 - `power`: 0 (barely moving) to 1 (a hard break, 8 m/s). Typical shots: 0.1–0.5.

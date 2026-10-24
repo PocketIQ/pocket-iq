@@ -88,3 +88,19 @@ export const simulateShot = (
     `/games/${id}/simulate`,
     json({ ...shot, power, spin }),
   )
+
+export interface PlanResponse {
+  physics: ShotPhysics | null // null: no power and spin tried pockets this shot
+  speed: Advice['speed'] | null
+  spin_name: Advice['spin'] | null
+}
+
+/**
+ * Physics only: the best power and spin for one shot from this layout. Needs no game,
+ * database or Gemini, so it also works for the dev test table.
+ */
+export const planShot = (
+  balls: { id: number | null; type: string; x: number; y: number }[],
+  group: 'solid' | 'stripe' | null,
+  shot: { target_id: number; pocket: string; kind: 'direct' | 'bank'; cut_angle?: number },
+) => request<PlanResponse>('/plan', json({ balls, group, ...shot }))

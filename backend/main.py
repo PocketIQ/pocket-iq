@@ -150,6 +150,23 @@ class SimulateRequest(BaseModel):
     spin: Spin = Spin()
 
 
+class PlanBall(BaseModel):
+    id: int | None = Field(default=None, ge=1, le=15)   # null = the cue ball
+    type: str                                            # "cue" | "eight" | "solid" | "stripe"
+    x: float = Field(ge=0, le=TABLE_W)
+    y: float = Field(ge=0, le=TABLE_H)
+
+
+class PlanRequest(BaseModel):
+    """A layout and a shot from the shot finder. No game needed."""
+    balls: list[PlanBall] = Field(max_length=16)
+    group: str | None = None             # the shooter's group; null = open table
+    target_id: int = Field(ge=1, le=15)
+    pocket: str
+    kind: str = "direct"
+    cut_angle: float | None = None
+
+
 @app.post("/games")
 def create_game(body: NewGame):
     state = game.new_game(body.players)
@@ -261,6 +278,26 @@ def simulate(game_id: str, body: SimulateRequest):
         "speed": physics.speed_word(body.power),
         "spin_name": physics.spin_word((body.spin.x, body.spin.y)),
     }
+
+
+@app.post("/plan")
+def plan_shot(body: PlanRequest):
+    """
+    Physics only: the best power and spin for this shot from this layout (pockets it, no
+    scratch, easiest next shot). No game, database or Gemini, so it works for any layout
+    the frontend has, including its test table. `physics` is null if nothing tried pockets it.
+    """
+    balls = [b.model_dump() for b in body.balls]
+    if not any(b["type"] == "cue" for b in balls):
+        raise HTTPException(409, "There's no cue ball in this layout.")
+    shot = physics.match_shot(balls, body.group, body.target_id, body.pocket, body.kind, body.cut_angle)
+    if shot is None:
+        raise HTTPException(409, "That shot isn't open from this layout.")
+    p = physics.plan(balls, shot, body.group)
+    if p is None:
+        return {"physics": None, "speed": None, "spin_name": None}
+    return {"physics": physics.plan_json(p), "speed": physics.speed_word(p.power),
+            "spin_name": physics.spin_word(p.spin)}
 
 
 @app.get("/games/{game_id}/advice/audio")
