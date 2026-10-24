@@ -4,6 +4,7 @@ import type {
   Candidate,
   Game,
   GameAnalyzeResponse,
+  GutterEntry,
   IntendedShot,
   LayoutBall,
   PlayerStats,
@@ -63,6 +64,16 @@ export function analyzeGamePhoto(
 export const correctLayout = (id: string, balls: LayoutBall[], intended: IntendedShot | null = null) => {
   const init = json({ balls, intended })
   return request<GameAnalyzeResponse>(`/games/${id}/layout`, { ...init, method: 'PUT' })
+}
+
+/**
+ * The player fixed the gutter: exactly these balls are pocketed. `balls`: the latest
+ * photo's layout with that change made (a ball put in the gutter taken off the table, one
+ * taken out placed back on); null when the table didn't change.
+ */
+export const correctPocketed = (id: string, pocketed: GutterEntry[], balls: LayoutBall[] | null) => {
+  const init = json({ pocketed, balls })
+  return request<GameAnalyzeResponse>(`/games/${id}/pocketed`, { ...init, method: 'PUT' })
 }
 
 export const getAdvice = (id: string, candidates: Candidate[]) =>

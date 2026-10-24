@@ -63,6 +63,7 @@ def new_game(players: list[str]) -> dict:
         "balls": {b: {"status": "on", "x": None, "y": None, "seen": False}
                   for b in ["cue", *map(str, range(1, 16))]},
         "history": [],               # one event per shot, newest last
+        "gutter": [],                # pocketed balls in order, and who they count for
         "last_advice": None,         # the coach's suggestion for the shot being played
         "photos": 0,                 # photos processed so far
         "photo": None,               # the latest photo's layout (what the editor shows)
@@ -210,8 +211,14 @@ def process_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
 
     shot = None
     if not first and state["winner"] is None and (pocketed or scratch or moved > MOVE_EPS):
+        shooter = state["turn"]
+        was_open = state["players"][shooter]["group"] is None
         shot = apply_shot(state, pocketed, scratch, intended)
         shot["photo"] = state["photos"] + 1
+        # The second photo shows the break: what went in then counts for no one.
+        by = None if shot["photo"] == 2 else shooter
+        gutter(state).extend({"ball": b, "by": by, "member": None, "photo": shot["photo"],
+                              "open": was_open} for b in pocketed)
     state["photos"] += 1
     state["photo"] = {"n": state["photos"], "balls": seen["balls"], "intended": intended}
     return {**seen, "shot": shot}
@@ -230,10 +237,15 @@ def replace_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     intended = intended or state["photo"].get("intended")   # keep what the player went for
     undone = state["history"][-1] if state["history"] and \
         state["history"][-1].get("photo") == state["photos"] else None
+    # Who the player said the latest shot's balls count for, to keep through the replay
+    fixed = {e["ball"]: e for e in gutter(state) if e["photo"] == state["photos"]}
     snapshot = state["undo"]
     state.clear()
     state.update(snapshot)
     result = process_photo(state, detections, corrected=corrected, intended=intended)
+    for e in gutter(state):
+        if e["photo"] == state["photos"] and e["ball"] in fixed:
+            e.update(by=fixed[e["ball"]]["by"], member=fixed[e["ball"]]["member"])
     return {**result, "undone": undone}
 
 
@@ -306,6 +318,80 @@ def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict |
     return event
 
 
+# ------------------------------------------------------------------ gutter
+def gutter(state: dict) -> list[dict]:
+    """
+    Pocketed balls in the order they went in: {ball, by, member, photo, open}.
+      by:     index into players it counts for; None = no one (the break, or not counted)
+      member: team mode's teammate, set by the app (the backend only knows the two sides)
+      photo:  the photo whose shot pocketed it; None if the player added it by hand
+      open:   the table was still open, so it can't be the "wrong" group's ball
+    Games from before the gutter get one built from their history.
+    """
+    if "gutter" not in state:
+        entries = [{"ball": b, "by": None if ev.get("photo") == 2 else
+                    next((i for i, p in enumerate(state["players"]) if p["name"] == ev["player"]), None),
+                    "member": None, "photo": ev.get("photo"), "open": False}
+                   for ev in state["history"] for b in ev["pocketed"]]
+        listed = {e["ball"] for e in entries}
+        older = [{"ball": int(b), "by": None, "member": None, "photo": None, "open": False}
+                 for b, v in state["balls"].items()
+                 if b != "cue" and v["status"] == "sunk" and int(b) not in listed]
+        state["gutter"] = older + entries
+    return state["gutter"]
+
+
+def _sink_only(state: dict, entries: list[dict]) -> None:
+    """Make exactly the gutter's balls sunk: the rest are back on the table."""
+    sunk = {str(e["ball"]) for e in entries}
+    for b in map(str, range(1, 16)):
+        ball = state["balls"][b]
+        if b in sunk:
+            ball["status"] = "sunk"
+        elif ball["status"] == "sunk":
+            ball.update(status="on", seen=False)
+
+
+def set_gutter(state: dict, entries: list[dict], layout: list[dict] | None = None) -> dict:
+    """
+    The player fixed the gutter: these are exactly the pocketed balls (everything else is
+    on the table), and who each one counts for. `layout`: the latest photo's balls with
+    that change made (a ball put in the gutter taken off the table, one taken out of it
+    placed back on), like place(). Turns and groups aren't recomputed.
+    Also fixes the state a layout correction rewinds to, so a later correction keeps it:
+    there, the balls the latest shot pocketed are left to the replay to find again.
+    Returns {balls, missing, rejected} for the latest photo (empty before the first).
+    """
+    seen_ids = set()
+    for e in entries:
+        if not 1 <= e["ball"] <= 15:
+            raise GameError(f"There's no ball {e['ball']}.")
+        if e["ball"] in seen_ids:
+            raise GameError(f"Ball {e['ball']} is in the gutter twice.")
+        if e["by"] not in (None, 0, 1):
+            raise GameError("A pocketed ball counts for player 0, player 1, or no one.")
+        seen_ids.add(e["ball"])
+    for item in layout or []:
+        if item.get("id") in seen_ids:
+            raise GameError(f"Ball {item['id']} can't be in the gutter and on the table.")
+
+    entries = [{"ball": e["ball"], "by": e["by"], "member": e.get("member"),
+                "photo": e.get("photo"), "open": bool(e.get("open"))} for e in entries]
+    state["gutter"] = entries
+    _sink_only(state, entries)
+    seen = {"balls": [], "missing": [], "rejected": []}
+    if layout is not None and state["photo"] is not None:
+        seen = place(state, layout)
+        state["photo"]["balls"] = seen["balls"]
+
+    before = state["undo"]
+    if before is not None:
+        latest = state["photos"]
+        before["gutter"] = [dict(e) for e in entries if e["photo"] != latest]
+        _sink_only(before, before["gutter"])
+    return seen
+
+
 def public(state: dict) -> dict:
     """What the frontend sees: no internal fields (coach state), recent history only."""
     return {
@@ -315,6 +401,7 @@ def public(state: dict) -> dict:
         "winner": state["winner"],
         "balls": {b: v["status"] for b, v in state["balls"].items()},
         "history": state["history"][-10:],
+        "gutter": gutter(state),
         # latest photo: {"n", "balls", "intended"}, or None before the first
         "layout": state["photo"],
     }

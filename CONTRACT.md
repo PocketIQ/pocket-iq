@@ -65,6 +65,8 @@ default because it's slow) Gemini double-checks which number each ball is.
                "intended": {"target": 2, "pocket": "top_left", "kind": "direct", "cut_angle": 18},
                "made": true, "coached": true,
                "advice": {"target_ball": 2, "pocket": "top_left", "made": true}}],
+  "gutter": [{"ball": 13, "by": null, "member": null, "photo": 2, "open": true},
+             {"ball": 2, "by": 0, "member": null, "photo": 4, "open": false}],
   "layout": {"n": 4, "balls": [{"id": null, "type": "cue", "x": 250, "y": 250, "confidence": 0.98}],
              "intended": null}
 }
@@ -75,6 +77,11 @@ default because it's slow) Gemini double-checks which number each ball is.
 - `intended`: the shot they went for (null if unknown); `made`: whether its target went in
 - `photo`: number of the photo that showed this shot's result
 - `history`: the last 10 shots
+- `gutter`: every pocketed ball, in the order they went in (the whole game, not just the
+  last 10 shots). `by`: index into `players` it counts for, null = no one (the break: what
+  the second photo showed). `member`: team mode's teammate, set by the app (null = the app
+  works it out from the shot). `photo`: the photo whose shot pocketed it, null = added by
+  hand. `open`: the table was still open, so it's never the wrong group's ball.
 - `layout`: the latest photo's balls (what the correction editor starts from); null
   before the first photo. `n` counts photos in this game.
 
@@ -110,6 +117,20 @@ or removed balls). Same response as `/analyze`, with `shot` recomputed.
 - `id` 1–15, or null with `"type": "cue"` for the cue ball. `x` 0–1000, `y` 0–500.
 - `intended` (optional): omit to keep the one sent with the original photo
 - 409 if a ball is listed twice or was pocketed in an earlier shot
+
+`PUT /games/{id}/pocketed`: the player fixed the gutter. Same response as `/analyze`
+(`shot` is always null; `balls` is the latest photo's layout after the fix).
+```json
+{"pocketed": [{"ball": 13, "by": null, "member": null, "photo": 2, "open": true},
+              {"ball": 9, "by": 1, "member": "Dee", "photo": null, "open": false}],
+ "balls": [{"id": null, "type": "cue", "x": 400, "y": 300}, {"id": 15, "x": 180, "y": 120}]}
+```
+- `pocketed`: EVERY pocketed ball, in order. Balls not listed are back on the table.
+- `balls` (optional): the latest photo's layout with that change made: a ball put in the
+  gutter taken off it, one taken out of the gutter placed where it really is. Omit (null)
+  when only who a ball counts for changed.
+- Turns, groups and the winner aren't recomputed. A later `PUT /layout` keeps the fix.
+- 409 if a ball is listed twice, or is both in `pocketed` and on the table
 
 `POST /games/{id}/advice` → which shot to take and how, for the player whose turn it is.
 Request: the top shots from `physics/shots.ts` (max 12), numbered by `index`:

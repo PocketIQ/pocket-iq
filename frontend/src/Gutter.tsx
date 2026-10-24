@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import { BallIcon } from './BallIcon'
 import { BallPicker } from './BallPicker'
-import type { GutterBall, GutterEdits } from './gutterBalls'
+import type { GutterBall } from './gutterBalls'
 import { Sheet } from './Sheet'
 import { SIDE_COLORS, type Rosters } from './teams'
 import type { Game } from './types'
@@ -60,33 +60,29 @@ function GutterSlot({ entry, onClick }: { entry: GutterBall; onClick: () => void
   )
 }
 
-/** The pocketed balls, in order, in a ball-return gutter. Tap one to fix detection mistakes. */
-export function Gutter({ game, rosters, balls, edits, onEdits }: {
+/**
+ * The pocketed balls, in order, in a ball-return gutter. Tap one to fix detection mistakes:
+ * who it counts for, or that it isn't pocketed at all. + adds one that was missed.
+ */
+export function Gutter({ game, rosters, balls, onSetWho, onRemove, onAdd }: {
   game: Game
   rosters: Rosters
   balls: GutterBall[]
-  edits: GutterEdits
-  onEdits: (edits: GutterEdits) => void
+  onSetWho: (ball: number, side: 0 | 1 | null, member: string | null) => void
+  onRemove: (ball: number) => void // back on the table
+  onAdd: (ball: number) => void // off the table
 }) {
   const [editing, setEditing] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
   const entry = balls.find(g => g.ball === editing)
 
-  function setWho(ball: number, side: 0 | 1 | null, member: string | null) {
-    onEdits({ ...edits, set: { ...edits.set, [ball]: { side, member } } })
-  }
-
   function remove(ball: number) {
-    onEdits({
-      ...edits,
-      added: edits.added.filter(b => b !== ball),
-      removed: edits.added.includes(ball) ? edits.removed : [...edits.removed, ball],
-    })
+    onRemove(ball)
     setEditing(null)
   }
 
   function add(ball: number) {
-    onEdits({ ...edits, added: [...edits.added, ball], removed: edits.removed.filter(b => b !== ball) })
+    onAdd(ball)
     setAdding(false)
     setEditing(ball) // straight to "who pocketed it?"
   }
@@ -132,12 +128,12 @@ export function Gutter({ game, rosters, balls, edits, onEdits }: {
                   key={p.name}
                   active={entry.side === i}
                   color={SIDE_COLORS[i]}
-                  onClick={() => setWho(entry.ball, i as 0 | 1, rosters?.[i][0] ?? null)}
+                  onClick={() => onSetWho(entry.ball, i as 0 | 1, rosters?.[i][0] ?? null)}
                 >
                   <span className="truncate">{p.name}</span>
                 </Chip>
               ))}
-              <Chip active={entry.side == null} onClick={() => setWho(entry.ball, null, null)}>
+              <Chip active={entry.side == null} onClick={() => onSetWho(entry.ball, null, null)}>
                 No one
               </Chip>
             </div>
@@ -149,7 +145,7 @@ export function Gutter({ game, rosters, balls, edits, onEdits }: {
                 <p className="text-sm font-medium">Which teammate?</p>
                 <div className="flex flex-wrap gap-1">
                   {rosters[entry.side].map(m => (
-                    <Chip key={m} active={entry.member === m} onClick={() => setWho(entry.ball, entry.side, m)}>
+                    <Chip key={m} active={entry.member === m} onClick={() => onSetWho(entry.ball, entry.side, m)}>
                       {m}
                     </Chip>
                   ))}
@@ -162,7 +158,7 @@ export function Gutter({ game, rosters, balls, edits, onEdits }: {
               onClick={() => remove(entry.ball)}
               className="mt-1 min-h-11 rounded-lg px-3 py-2 text-sm font-semibold text-red-700 active:bg-red-50 dark:text-red-400 dark:active:bg-red-950"
             >
-              Not pocketed: remove from gutter
+              Not pocketed: put it back on the table
             </button>
           </div>
         </Sheet>

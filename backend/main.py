@@ -118,6 +118,20 @@ class Layout(BaseModel):
     intended: Intended | None = None
 
 
+class GutterBall(BaseModel):
+    """One pocketed ball, and who it counts for."""
+    ball: int = Field(ge=1, le=15)
+    by: int | None = Field(default=None, ge=0, le=1)   # index into players; null = no one
+    member: str | None = Field(default=None, max_length=40)
+    photo: int | None = None
+    open: bool = False
+
+
+class Gutter(BaseModel):
+    pocketed: list[GutterBall] = Field(max_length=15)
+    balls: list[LayoutBall] | None = Field(default=None, max_length=16)
+
+
 class Candidate(BaseModel):
     """One shot from the frontend's shot finder (frontend/src/physics/shots.ts)."""
     index: int
@@ -208,6 +222,29 @@ def correct_layout(game_id: str, body: Layout):
     except game.GameError as e:
         raise HTTPException(409, str(e))
     return _photo_result(state, result)
+
+
+@app.put("/games/{game_id}/pocketed")
+def correct_pocketed(game_id: str, body: Gutter):
+    """
+    The player fixed the gutter: exactly these balls are pocketed, in this order, each
+    counting for whoever `by` says. `balls`: the latest photo's layout with that change
+    made (a ball put in the gutter taken off the table, one taken out placed back on).
+    """
+    state = _load(game_id)
+    try:
+        seen = game.set_gutter(state, [g.model_dump() for g in body.pocketed],
+                               body.balls and [b.model_dump() for b in body.balls])
+    except game.GameError as e:
+        raise HTTPException(409, str(e))
+    _save(state)
+    return {
+        "table": {"width": TABLE_W, "height": TABLE_H},
+        "ball_radius": BALL_RADIUS,
+        **seen,
+        "shot": None,
+        "game": game.public(state),
+    }
 
 
 @app.post("/games/{game_id}/advice")

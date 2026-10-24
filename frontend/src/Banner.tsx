@@ -8,27 +8,15 @@ const RACK = [[1], [9, 6], [2, 8, 14], [10, 7, 15, 5], [3, 11, 12, 4, 13]]
 function RackDiagram() {
   return (
     <div className="flex flex-col items-center gap-3">
-      {/* Wooden triangle with the balls packed inside, apex at the top */}
-      <div className="relative px-4 pt-5 pb-3">
-        <div
-          className="absolute inset-0 bg-amber-800"
-          style={{ clipPath: 'polygon(50% 0, 100% 100%, 0 100%)' }}
-          aria-hidden="true"
-        />
-        <div
-          className="absolute inset-[7px] bg-teal-700"
-          style={{ clipPath: 'polygon(50% 0, 100% 100%, 0 100%)' }}
-          aria-hidden="true"
-        />
-        <div className="relative flex flex-col items-center" role="img" aria-label={`Rack, front to back: ${RACK.map(r => r.join(' ')).join(', ')}`}>
-          {RACK.map((row, i) => (
-            <div key={i} className="-mt-1 flex first:mt-0">
-              {row.map(n => (
-                <BallIcon key={n} n={n} className="size-10" />
-              ))}
-            </div>
-          ))}
-        </div>
+      {/* The balls packed in a triangle, apex (the foot spot) at the top */}
+      <div className="flex flex-col items-center py-2" role="img" aria-label={`Rack, front to back: ${RACK.map(r => r.join(' ')).join(', ')}`}>
+        {RACK.map((row, i) => (
+          <div key={i} className="-mt-1 flex first:mt-0">
+            {row.map(n => (
+              <BallIcon key={n} n={n} className="size-10" />
+            ))}
+          </div>
+        ))}
       </div>
       <ul className="flex flex-col gap-1.5 self-stretch text-sm text-stone-700 dark:text-stone-300">
         <li>• The <b>1</b> goes at the front, on the foot spot.</li>

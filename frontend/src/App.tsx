@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { adviceAudioUrl, analyzeGamePhoto, correctLayout, createGame, getAdvice, getGame } from './api'
+import { adviceAudioUrl, analyzeGamePhoto, correctLayout, correctPocketed, createGame, getAdvice, getGame } from './api'
 import { BallPicker } from './BallPicker'
 import { Banner } from './Banner'
 import { EditToolbar } from './EditToolbar'
 import { Gutter } from './Gutter'
-import { applyEdits, deriveGutter, loadEdits, NO_EDITS, saveEdits, type GutterEdits } from './gutterBalls'
+import { gutterView, withGutter } from './gutterBalls'
 import { MOCK_ROSTERS, MOCK_TABLE, mockGame } from './mockTable'
 import { findShots, type Shot } from './physics/shots'
 import { resizeImage } from './resizeImage'
@@ -12,7 +12,7 @@ import { Setup } from './Setup'
 import { RAIL, TableCanvas } from './TableCanvas'
 import { loadRosters, saveRosters, SIDE_COLORS, teamTurns, type Rosters } from './teams'
 import type { Tool } from './EditToolbar'
-import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, IntendedShot, LayoutBall, ShotEvent } from './types'
+import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, GutterEntry, IntendedShot, LayoutBall, ShotEvent } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading'; what: string } | { kind: 'error'; message: string }
 
@@ -72,6 +72,15 @@ function setBall(balls: Ball[], index: number, n: number): Ball[] {
     if (holds) return { ...ball, type: target.type, id: target.id, confidence: 1 }
     return ball
   })
+}
+
+const ballType = (n: number): Ball['type'] => (n === 8 ? 'eight' : n < 8 ? 'solid' : 'stripe')
+
+/** A gutter fix that changes the table: a ball comes off it, or goes back on at a spot. */
+type TableChange = { off: number } | { on: Ball }
+
+function changeTable(balls: Ball[], change: TableChange): Ball[] {
+  return 'off' in change ? balls.filter(b => b.id !== change.off) : [...balls, change.on]
 }
 
 const TOOL_HINTS: Record<Tool, string> = {
@@ -232,7 +241,7 @@ export default function App() {
   const [adviceCount, setAdviceCount] = useState(0) // new audio URL per piece of advice
   const coachRequest = useRef(0) // bumped to drop advice for a layout that's since changed
   const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
-  const [gutterEdits, setGutterEdits] = useState<GutterEdits>(NO_EDITS)
+  const [placing, setPlacing] = useState<number | null>(null) // ball taken out of the gutter, to put on the table
 
   const busy = status.kind === 'loading'
   const devMode = game?.id === DEV_GAME_ID
@@ -250,7 +259,6 @@ export default function App() {
         .then(g => {
           setGame(g)
           setRosters(loadRosters(g.id))
-          setGutterEdits(loadEdits(g.id))
           loadView(viewFromLayout(g))
         })
         .catch(() => localStorage.removeItem(GAME_KEY))
@@ -259,10 +267,7 @@ export default function App() {
   const player = game ? game.players[game.turn] : null
   const turns = useMemo(() => (game ? teamTurns(game, rosters) : null), [game, rosters])
   const shooterName = turns?.up ?? player?.name // in team mode, the teammate who's up
-  const gutter = useMemo(
-    () => (game && turns ? applyEdits(game, deriveGutter(game, turns.byShot), gutterEdits) : []),
-    [game, turns, gutterEdits],
-  )
+  const gutter = useMemo(() => (game && turns ? gutterView(game, turns.byShot) : []), [game, turns])
   const shots = useMemo(
     () => (view && player && confirmed ? findShots(view.balls, view.table, view.ball_radius, player.group) : []),
     [view, player, confirmed],
@@ -295,6 +300,7 @@ export default function App() {
     setConfirmed(false)
     setHistory(EMPTY_HISTORY)
     setPicking(null)
+    setPlacing(null)
     setSelected(0)
     resetCoach()
   }
@@ -310,7 +316,6 @@ export default function App() {
     saveRosters(g.id, teams)
     setGame(g)
     setRosters(teams)
-    setGutterEdits(NO_EDITS)
     loadView(null)
   }
 
@@ -318,14 +323,55 @@ export default function App() {
     const g = mockGame(teams)
     setGame(g)
     setRosters(teams ? MOCK_ROSTERS : null)
-    setGutterEdits(NO_EDITS)
     setStatus({ kind: 'idle' })
     loadView({ ...structuredClone(MOCK_TABLE), missing: [], rejected: [], shot: null, game: g })
   }
 
-  function editGutter(edits: GutterEdits) {
-    setGutterEdits(edits)
-    if (game && !devMode) saveEdits(game.id, edits)
+  // The gutter is the backend's record of what's pocketed: fixing it also takes a ball off
+  // the table, or puts one back. Unsaved layout edits are kept; the coach starts over.
+  async function saveGutter(next: GutterEntry[], change?: TableChange) {
+    if (!game || busy) return
+    let saved: Ball[] | null = serverBalls && change ? changeTable(serverBalls, change) : serverBalls
+    if (devMode) {
+      setGame(withGutter(game, next))
+    } else {
+      const res = await run('Saving the gutter…', () =>
+        correctPocketed(game.id, next, change && saved ? toLayout(saved) : null),
+      )
+      if (!res) return
+      setGame(res.game)
+      if (change && saved) saved = res.balls
+    }
+    if (!change || !view) return
+    setView({ ...view, balls: view.balls === serverBalls ? (saved ?? view.balls) : changeTable(view.balls, change) })
+    setServerBalls(saved)
+    setHistory(EMPTY_HISTORY) // undo can't bring back a ball that's in the gutter now
+    setConfirmed(false)
+    resetCoach()
+  }
+
+  function setWho(ball: number, by: 0 | 1 | null, member: string | null) {
+    if (game) saveGutter(game.gutter.map(e => (e.ball === ball ? { ...e, by, member } : e)))
+  }
+
+  function addToGutter(ball: number) {
+    if (!game) return
+    const entry: GutterEntry = { ball, by: null, member: null, photo: null, open: false }
+    saveGutter([...game.gutter, entry], view?.balls.some(b => b.id === ball) ? { off: ball } : undefined)
+  }
+
+  // Back on the table: with a photo, they tap where it is first; without one, there's nowhere to put it.
+  function removeFromGutter(ball: number) {
+    if (!game) return
+    if (view) setPlacing(ball)
+    else saveGutter(game.gutter.filter(e => e.ball !== ball))
+  }
+
+  function placeBall(x: number, y: number) {
+    if (!game || placing == null) return
+    const ball: Ball = { id: placing, type: ballType(placing), x, y, confidence: 1 }
+    setPlacing(null)
+    saveGutter(game.gutter.filter(e => e.ball !== ball.id), { on: ball })
   }
 
   // Every photo after the first shows the result of the shot before it: the backend
@@ -440,7 +486,6 @@ export default function App() {
     }
     setGame(null)
     setRosters(null)
-    setGutterEdits(NO_EDITS)
     loadView(null)
   }
 
@@ -448,6 +493,17 @@ export default function App() {
   const needsCheck = view ? view.balls.filter(ball => ball.confidence < 0.7).length : 0
   const sunk = new Set(
     Object.entries(game?.balls ?? {}).filter(([b, s]) => s === 'sunk' && b !== 'cue').map(([b]) => Number(b)),
+  )
+
+  const gutterPanel = game && (
+    <Gutter
+      game={game}
+      rosters={rosters}
+      balls={gutter}
+      onSetWho={setWho}
+      onRemove={removeFromGutter}
+      onAdd={addToGutter}
+    />
   )
 
   return (
@@ -486,7 +542,6 @@ export default function App() {
         {game && (
           <>
             <Scoreboard game={game} up={turns?.up ?? null} />
-            <Gutter game={game} rosters={rosters} balls={gutter} edits={gutterEdits} onEdits={editGutter} />
 
             {view?.shot ? (
               <p className="rounded-lg bg-white px-4 py-3 text-sm shadow-sm dark:bg-stone-900">
@@ -522,6 +577,9 @@ export default function App() {
               <PhotoButton disabled={busy} onFile={f => handlePhoto(f, true)} label="Retake the last photo" />
             )}
 
+            {/* No table to show yet (or the game's over): the gutter goes where it would be */}
+            {!(view && game.winner == null) && gutterPanel}
+
             {view && game.winner == null && (
               <section className="flex flex-col gap-2">
                 {!confirmed && needsCheck > 0 && (
@@ -543,7 +601,7 @@ export default function App() {
 
                 {/* .table-stage goes full screen in phone landscape (see index.css) */}
                 <div
-                  className="table-stage"
+                  className="table-stage relative"
                   style={{ '--table-aspect': (view.table.width + RAIL * 2) / (view.table.height + RAIL * 2) } as React.CSSProperties}
                 >
                   <TableCanvas
@@ -553,7 +611,22 @@ export default function App() {
                     showConfidence={!confirmed}
                     highlight={picking}
                     onBallTap={confirmed ? undefined : onBallTap}
+                    onTableTap={placing == null ? undefined : placeBall}
                   />
+                  {placing != null && (
+                    <div className="absolute inset-x-0 top-2 z-10 flex justify-center px-2">
+                      <p role="status" className="flex items-center gap-3 rounded-full bg-stone-950/85 py-1.5 pr-1.5 pl-4 text-sm font-semibold text-white shadow-lg">
+                        Tap where the {placing} is
+                        <button
+                          type="button"
+                          onClick={() => setPlacing(null)}
+                          className="rounded-full bg-white/15 px-3 py-1.5 active:bg-white/25"
+                        >
+                          Cancel
+                        </button>
+                      </p>
+                    </div>
+                  )}
                   {!confirmed && (
                     <div className="stage-tools">
                       <EditToolbar
@@ -569,6 +642,8 @@ export default function App() {
                     </div>
                   )}
                 </div>
+
+                {gutterPanel}
 
                 {!confirmed ? (
                   <>

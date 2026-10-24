@@ -19,13 +19,16 @@ function polyline(ctx: CanvasRenderingContext2D, pts: Vec[]) {
   ctx.stroke()
 }
 
+/** A pointer position in table units. */
+function toTable(data: AnalyzeResponse, canvas: HTMLCanvasElement, clientX: number, clientY: number) {
+  const rect = canvas.getBoundingClientRect()
+  const s = rect.width / (data.table.width + 2 * RAIL)
+  return { x: (clientX - rect.left) / s - RAIL, y: (clientY - rect.top) / s - RAIL }
+}
+
 /** Nearest ball to a pointer, in table units. 2 radii, then 3 if that misses. */
 function ballIndexAt(data: AnalyzeResponse, canvas: HTMLCanvasElement, clientX: number, clientY: number): number | null {
-  const rect = canvas.getBoundingClientRect()
-  const TW = data.table.width
-  const s = rect.width / (TW + 2 * RAIL)
-  const tx = (clientX - rect.left) / s - RAIL
-  const ty = (clientY - rect.top) / s - RAIL
+  const { x: tx, y: ty } = toTable(data, canvas, clientX, clientY)
   const r = data.ball_radius
 
   let nearest = -1
@@ -85,6 +88,7 @@ export function TableCanvas({
   showConfidence = true,
   highlight = null,
   onBallTap,
+  onTableTap,
 }: {
   data: AnalyzeResponse
   shots?: Shot[]
@@ -93,15 +97,17 @@ export function TableCanvas({
   /** Index of a ball to ring, e.g. the one the ball picker is open for. */
   highlight?: number | null
   onBallTap?: (index: number) => void
+  /** Tap anywhere on the cloth (wins over onBallTap), in table units: placing a ball. */
+  onTableTap?: (x: number, y: number) => void
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
   const press = useRef<Press | null>(null)
 
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (e.button !== 0 || !onBallTap) return
+    if (e.button !== 0 || !(onBallTap || onTableTap)) return
     const canvas = ref.current
     if (!canvas) return
-    const index = ballIndexAt(data, canvas, e.clientX, e.clientY)
+    const index = onTableTap ? -1 : ballIndexAt(data, canvas, e.clientX, e.clientY)
     if (index == null) return
     e.preventDefault()
     try {
@@ -122,7 +128,15 @@ export function TableCanvas({
     const current = press.current
     if (!current || current.pointerId !== e.pointerId) return
     press.current = null
-    if (tap && !current.moved) onBallTap?.(current.index)
+    if (!tap || current.moved) return
+    const canvas = ref.current
+    if (onTableTap && canvas) {
+      // Keep the whole ball on the cloth
+      const { x, y } = toTable(data, canvas, e.clientX, e.clientY)
+      const r = data.ball_radius
+      const clamp = (v: number, max: number) => Math.min(Math.max(v, r), max - r)
+      onTableTap(clamp(x, data.table.width), clamp(y, data.table.height))
+    } else if (current.index >= 0) onBallTap?.(current.index)
   }
 
   useEffect(() => {

@@ -59,6 +59,12 @@ export function mockGame(teams: boolean): Game {
       shot(6, a, [], 'turn passes'),
       shot(7, b, [], 'turn passes'),
     ],
+    gutter: [
+      { ball: 13, by: null, member: null, photo: 2, open: true },
+      { ball: 15, by: 1, member: null, photo: 3, open: true },
+      { ball: 2, by: 1, member: null, photo: 4, open: false },
+      { ball: 7, by: 0, member: null, photo: 5, open: false },
+    ],
     layout: null,
   }
 }
