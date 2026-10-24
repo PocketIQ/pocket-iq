@@ -1,14 +1,36 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { analyzePhoto } from './api'
+import { findShots } from './physics/shots'
 import { resizeImage } from './resizeImage'
 import { TableCanvas } from './TableCanvas'
+import type { Group } from './physics/shots'
 import type { AnalyzeResponse } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading' } | { kind: 'error'; message: string }
 
+const GROUPS: { value: Group; label: string }[] = [
+  { value: 'solid', label: 'Solids' },
+  { value: 'stripe', label: 'Stripes' },
+  { value: null, label: 'Table open' },
+]
+
+function difficultyLabel(difficulty: number): string {
+  if (difficulty < 0.35) return 'Easy'
+  if (difficulty < 0.6) return 'Medium'
+  return 'Hard'
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
+  const [group, setGroup] = useState<Group>(null)
+  const [selected, setSelected] = useState(0)
+
+  const shots = useMemo(() => result ? findShots(result.balls, result.table, result.ball_radius, group) : [], [result, group])
+
+  useEffect(() => {
+    setSelected(0)
+  }, [shots])
 
   async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
@@ -63,7 +85,28 @@ export default function App() {
 
         {result && (
           <section className="flex flex-col gap-2">
-            <TableCanvas data={result} />
+            <div role="group" aria-label="Group" className="grid grid-cols-3 gap-1 rounded-xl bg-stone-200 p-1 dark:bg-stone-800">
+              {GROUPS.map((option) => {
+                const active = group === option.value
+                return (
+                  <button
+                    key={option.label}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setGroup(option.value)}
+                    className={`rounded-lg px-2 py-2 text-sm font-semibold ${
+                      active
+                        ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-950 dark:text-stone-100'
+                        : 'text-stone-600 dark:text-stone-400'
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                )
+              })}
+            </div>
+
+            <TableCanvas data={result} shots={shots.slice(0, 3)} selected={selected} />
             <p className="text-xs text-stone-500">
               {result.balls.length} balls · dashed ring = low confidence
               {result.debug?.markers_used &&
@@ -71,6 +114,39 @@ export default function App() {
               {result.debug &&
                 ` · ${result.debug.image_size.join('×')}`}
             </p>
+
+            {shots.length === 0 ? (
+              <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 dark:bg-stone-900 dark:text-stone-400">
+                No clear shot found
+              </p>
+            ) : (
+              <ul className="flex flex-col gap-2">
+                {shots.slice(0, 3).map((shot, i) => {
+                  const active = i === selected
+                  return (
+                    <li key={`${shot.targetIndex}-${shot.pocket}-${shot.kind}-${i}`}>
+                      <button
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => setSelected(i)}
+                        className={`w-full rounded-xl px-4 py-3 text-left ${
+                          active
+                            ? 'bg-emerald-700 text-white'
+                            : 'bg-white text-stone-900 dark:bg-stone-900 dark:text-stone-100'
+                        }`}
+                      >
+                        <span className="block font-semibold">
+                          Ball {shot.targetId ?? '?'} {'->'} {shot.pocket.replaceAll('_', ' ')}
+                        </span>
+                        <span className={`mt-0.5 block text-sm ${active ? 'text-emerald-100' : 'text-stone-600 dark:text-stone-400'}`}>
+                          {shot.kind} · {shot.cutAngle}° · {difficultyLabel(shot.difficulty)}
+                        </span>
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
           </section>
         )}
       </div>
