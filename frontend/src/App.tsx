@@ -1,16 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { adviceAudioUrl, analyzeGamePhoto, correctLayout, createGame, getAdvice, getGame, planShot } from './api'
+import { adviceAudioUrl, analyzeGamePhoto, correctLayout, correctPocketed, createGame, getAdvice, getGame, planShot } from './api'
 import type { PlanResponse } from './api'
 import { BallPicker } from './BallPicker'
+import { Banner } from './Banner'
 import { EditToolbar } from './EditToolbar'
-import { MOCK_TABLE } from './mockTable'
+import { Gutter } from './Gutter'
+import { gutterView, withGutter } from './gutterBalls'
+import { MOCK_ROSTERS, MOCK_TABLE, mockGame } from './mockTable'
 import { findShots, type Shot } from './physics/shots'
 import { resizeImage } from './resizeImage'
+import { Setup } from './Setup'
 import { ShotGuide } from './ShotGuide'
 import { guideFromPlan, placeholderGuide } from './spinPower'
 import { RAIL, TableCanvas } from './TableCanvas'
+import { loadRosters, saveRosters, SIDE_COLORS, teamTurns, type Rosters } from './teams'
 import type { Tool } from './EditToolbar'
-import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, IntendedShot, LayoutBall, ShotEvent } from './types'
+import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, GutterEntry, IntendedShot, LayoutBall, ShotEvent } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading'; what: string } | { kind: 'error'; message: string }
 
@@ -29,16 +34,7 @@ const GAME_KEY = 'cueiq.game' // resume the game after a reload
 const SHOTS_SHOWN = 3
 const SHOTS_TO_COACH = 8
 
-// Dev only: a local game for the test table, so the editor works without the backend.
-const DEV_GAME: Game = {
-  id: 'dev',
-  players: [{ name: 'You', group: null }, { name: 'Friend', group: null }],
-  turn: 0,
-  winner: null,
-  balls: Object.fromEntries(['cue', ...Array.from({ length: 15 }, (_, i) => String(i + 1))].map(b => [b, 'on'])),
-  history: [],
-  layout: null,
-}
+const DEV_GAME_ID = 'dev' // the test table's local game: no backend
 
 function errorMessage(err: unknown): string {
   return err instanceof TypeError
@@ -90,6 +86,15 @@ function setBall(balls: Ball[], index: number, n: number): Ball[] {
   })
 }
 
+const ballType = (n: number): Ball['type'] => (n === 8 ? 'eight' : n < 8 ? 'solid' : 'stripe')
+
+/** A gutter fix that changes the table: a ball comes off it, or goes back on at a spot. */
+type TableChange = { off: number } | { on: Ball }
+
+function changeTable(balls: Ball[], change: TableChange): Ball[] {
+  return 'off' in change ? balls.filter(b => b.id !== change.off) : [...balls, change.on]
+}
+
 const TOOL_HINTS: Record<Tool, string> = {
   label: 'Tap a ball to say which one it is.',
   remove: 'Tap a ball that isn’t really there.',
@@ -103,41 +108,7 @@ function difficultyLabel(difficulty: number): string {
   return 'Hard'
 }
 
-function Setup({ onStart, busy }: { onStart: (names: [string, string]) => void; busy: boolean }) {
-  const [names, setNames] = useState<[string, string]>(['', ''])
-  return (
-    <form
-      className="flex flex-col gap-3"
-      onSubmit={e => {
-        e.preventDefault()
-        onStart(names)
-      }}
-    >
-      <p className="text-sm text-stone-600 dark:text-stone-400">
-        8-ball, two players. The coach remembers each player across games, so use the same names next time.
-      </p>
-      {[0, 1].map(i => (
-        <label key={i} className="flex flex-col gap-1 text-sm font-medium">
-          {i === 0 ? 'Player 1 (breaks)' : 'Player 2'}
-          <input
-            required
-            value={names[i]}
-            onChange={e => setNames(n => (i === 0 ? [e.target.value, n[1]] : [n[0], e.target.value]))}
-            className="rounded-lg border border-stone-300 bg-white px-3 py-2 text-base dark:border-stone-700 dark:bg-stone-900"
-          />
-        </label>
-      ))}
-      <button
-        disabled={busy}
-        className="rounded-xl bg-emerald-700 px-5 py-3 text-lg font-semibold text-white active:bg-emerald-800 disabled:opacity-60"
-      >
-        {busy ? 'Starting…' : 'Start game'}
-      </button>
-    </form>
-  )
-}
-
-function Scoreboard({ game }: { game: Game }) {
+function Scoreboard({ game, up }: { game: Game; up: string | null }) {
   return (
     <div className="grid grid-cols-2 gap-2">
       {game.players.map((p, i) => {
@@ -146,18 +117,20 @@ function Scoreboard({ game }: { game: Game }) {
             ([b, s]) => s === 'on' && b !== 'cue' && b !== '8' && (Number(b) < 8) === (p.group === 'solid'),
           ).length
           : null
-        const up = game.winner == null && game.turn === i
+        const isUp = game.winner == null && game.turn === i
+        const shooter = isUp ? up : null
         return (
           <div
             key={p.name}
-            className={`rounded-lg px-3 py-2 ${up ? 'bg-emerald-700 text-white' : 'bg-stone-200 dark:bg-stone-800'}`}
+            className={`rounded-lg px-3 py-2 ${isUp ? 'bg-emerald-700 text-white' : 'bg-stone-200 dark:bg-stone-800'}`}
           >
-            <div className="font-semibold">
-              {p.name} {game.winner === i && '🏆'}
+            <div className="flex items-center gap-1.5 font-semibold">
+              <span className="size-2.5 shrink-0 rounded-full ring-1 ring-black/20" style={{ background: SIDE_COLORS[i] }} aria-hidden="true" />
+              <span className="truncate">{p.name}</span> {game.winner === i && '🏆'}
             </div>
             <div className="text-xs opacity-80">
               {p.group ? `${p.group}s · ${left} left` : 'open table'}
-              {up && ' · your shot'}
+              {isUp && (shooter ? ` · ${shooter}’s shot` : ' · your shot')}
             </div>
           </div>
         )
@@ -266,6 +239,44 @@ function PhotoButton({ label, onFile, disabled, primary }: {
   )
 }
 
+/** Full screen's photo button: the next photo without leaving the table view. */
+function CameraButton({ label, onFile, disabled, busy }: {
+  label: string
+  onFile: (file: File) => void
+  disabled: boolean
+  busy: boolean
+}) {
+  return (
+    <label
+      aria-label={busy ? 'Reading the table…' : label}
+      className={`flex h-14 w-20 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-emerald-700 text-white shadow-md focus-within:ring-4 focus-within:ring-emerald-400 active:bg-emerald-800 ${
+        disabled ? 'opacity-60' : ''
+      }`}
+    >
+      {busy ? (
+        <span className="size-6 animate-spin rounded-full border-[3px] border-white border-t-transparent" aria-hidden="true" />
+      ) : (
+        <svg viewBox="0 0 24 24" className="size-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" />
+          <circle cx="12" cy="13" r="3.5" />
+        </svg>
+      )}
+      <input
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        disabled={disabled}
+        onChange={e => {
+          const file = e.target.files?.[0]
+          e.target.value = ''
+          if (file) onFile(file)
+        }}
+      />
+    </label>
+  )
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [game, setGame] = useState<Game | null>(null)
@@ -281,9 +292,11 @@ export default function App() {
   const coachRequest = useRef(0) // bumped to drop advice for a layout that's since changed
   // Physics plan (spin and power) and the shot it's for: a stale one is simply not shown.
   const [plan, setPlan] = useState<{ shot: Shot; result: PlanResponse | null } | null>(null)
+  const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
+  const [placing, setPlacing] = useState<number | null>(null) // ball taken out of the gutter, to put on the table
 
   const busy = status.kind === 'loading'
-  const devMode = game?.id === DEV_GAME.id
+  const devMode = game?.id === DEV_GAME_ID
 
   // Resume the last game after a reload.
   useEffect(() => {
@@ -297,12 +310,16 @@ export default function App() {
       getGame(id)
         .then(g => {
           setGame(g)
+          setRosters(loadRosters(g.id))
           loadView(viewFromLayout(g))
         })
         .catch(() => localStorage.removeItem(GAME_KEY))
   }, [])
 
   const player = game ? game.players[game.turn] : null
+  const turns = useMemo(() => (game ? teamTurns(game, rosters) : null), [game, rosters])
+  const shooterName = turns?.up ?? player?.name // in team mode, the teammate who's up
+  const gutter = useMemo(() => (game && turns ? gutterView(game, turns.byShot) : []), [game, turns])
   const shots = useMemo(
     () => (view && player && confirmed ? findShots(view.balls, view.table, view.ball_radius, player.group) : []),
     [view, player, confirmed],
@@ -353,11 +370,12 @@ export default function App() {
     setConfirmed(false)
     setHistory(EMPTY_HISTORY)
     setPicking(null)
+    setPlacing(null)
     setSelected(0)
     resetCoach()
   }
 
-  async function start(names: [string, string]) {
+  async function start(names: [string, string], teams: Rosters) {
     const g = await run('Starting…', () => createGame(names))
     if (!g) return
     try {
@@ -365,14 +383,70 @@ export default function App() {
     } catch {
       /* resuming after reload just won't work */
     }
+    saveRosters(g.id, teams)
     setGame(g)
+    setRosters(teams)
     loadView(null)
   }
 
-  function loadTestTable() {
-    setGame(DEV_GAME)
+  function loadTestTable(teams: boolean) {
+    const g = mockGame(teams)
+    setGame(g)
+    setRosters(teams ? MOCK_ROSTERS : null)
     setStatus({ kind: 'idle' })
-    loadView({ ...structuredClone(MOCK_TABLE), missing: [], rejected: [], shot: null, game: DEV_GAME })
+    loadView({ ...structuredClone(MOCK_TABLE), missing: [], rejected: [], shot: null, game: g })
+  }
+
+  // The gutter is the backend's record of what's pocketed: fixing it also takes a ball off
+  // the table, or puts one back. Unsaved layout edits are kept; the coach starts over.
+  async function saveGutter(next: GutterEntry[], change?: TableChange) {
+    if (!game || busy) return
+    let saved: Ball[] | null = serverBalls && change ? changeTable(serverBalls, change) : serverBalls
+    if (devMode) {
+      setGame(withGutter(game, next))
+    } else {
+      const res = await run('Saving the gutter…', () =>
+        correctPocketed(game.id, next, change && saved ? toLayout(saved) : null),
+      )
+      if (!res) return
+      setGame(res.game)
+      if (change && saved) saved = res.balls
+    }
+    if (!change || !view) return
+    setView({ ...view, balls: view.balls === serverBalls ? (saved ?? view.balls) : changeTable(view.balls, change) })
+    setServerBalls(saved)
+    setHistory(EMPTY_HISTORY) // undo can't bring back a ball that's in the gutter now
+    setConfirmed(false)
+    resetCoach()
+  }
+
+  function setWho(ball: number, by: 0 | 1 | null, member: string | null) {
+    if (game) saveGutter(game.gutter.map(e => (e.ball === ball ? { ...e, by, member } : e)))
+  }
+
+  function addToGutter(ball: number) {
+    if (!game) return
+    const entry: GutterEntry = { ball, by: null, member: null, photo: null, open: false }
+    saveGutter([...game.gutter, entry], view?.balls.some(b => b.id === ball) ? { off: ball } : undefined)
+  }
+
+  // Back on the table: with a photo, they tap where it is first; without one, there's nowhere to put it.
+  function removeFromGutter(ball: number) {
+    if (!game) return
+    if (view) setPlacing(ball)
+    else saveGutter(game.gutter.filter(e => e.ball !== ball))
+  }
+
+  // A ball from the gutter goes back on the table (saved); a loose one is a layout edit.
+  function placeBall(x: number, y: number) {
+    if (!game || !view || placing == null) return
+    const ball: Ball =
+      placing === 0
+        ? { id: null, type: 'cue', x, y, confidence: 1 }
+        : { id: placing, type: ballType(placing), x, y, confidence: 1 }
+    setPlacing(null)
+    if (game.gutter.some(e => e.ball === placing)) saveGutter(game.gutter.filter(e => e.ball !== placing), { on: ball })
+    else commit(changeTable(view.balls, { on: ball }))
   }
 
   // Every photo after the first shows the result of the shot before it: the backend
@@ -446,6 +520,10 @@ export default function App() {
       setStatus({ kind: 'error', message: 'Every ball needs a number before confirming. Tap it with Set ball.' })
       return
     }
+    if (loose.length) {
+      setStatus({ kind: 'error', message: 'Every ball has to be on the table or in the gutter. Tap the ones marked ? to say where.' })
+      return
+    }
     let current = view
     let currentGame = game
     if (!devMode && view.balls !== serverBalls) {
@@ -491,6 +569,7 @@ export default function App() {
       /* nothing to forget */
     }
     setGame(null)
+    setRosters(null)
     loadView(null)
   }
 
@@ -506,23 +585,33 @@ export default function App() {
   const sunk = new Set(
     Object.entries(game?.balls ?? {}).filter(([b, s]) => s === 'sunk' && b !== 'cue').map(([b]) => Number(b)),
   )
+  // Every ball is on the table or in the gutter; these are neither (0 = the cue ball).
+  const onTable = new Set(view?.balls.map(b => (b.type === 'cue' ? 0 : b.id)) ?? [])
+  const loose = view ? Array.from({ length: 16 }, (_, n) => n).filter(n => !onTable.has(n) && !sunk.has(n)) : []
+
+  const gutterPanel = (compact = false) =>
+    game && (
+      <Gutter
+        game={game}
+        rosters={rosters}
+        balls={gutter}
+        loose={loose}
+        compact={compact}
+        onSetWho={setWho}
+        onRemove={removeFromGutter}
+        onAdd={addToGutter}
+        onPlace={setPlacing}
+      />
+    )
 
   return (
     <main className="min-h-dvh bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
-      <div className="mx-auto max-w-2xl px-4 py-6 flex flex-col gap-5">
-        <header className="flex items-start justify-between gap-3">
-          <div>
-            <h1 className="text-2xl font-bold">PocketIQ</h1>
-            <p className="text-sm text-stone-600 dark:text-stone-400">
-              After every shot, once the balls stop, snap the whole table before anyone touches it.
-            </p>
-          </div>
-          {game && (
-            <button onClick={newGame} className="shrink-0 py-1 text-sm text-stone-500 underline">
-              New game
-            </button>
-          )}
-        </header>
+      <Banner onNewGame={game ? newGame : undefined} />
+      <div className="mx-auto max-w-2xl px-4 py-5 flex flex-col gap-5">
+        <h1 className="sr-only">PocketIQ</h1>
+        <p className="-mb-2 text-sm text-stone-600 dark:text-stone-400">
+          After every shot, once the balls stop, snap the whole table before anyone touches it.
+        </p>
 
         {status.kind === 'error' && (
           <p role="alert" className="rounded-lg bg-red-100 px-4 py-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-200">
@@ -534,18 +623,23 @@ export default function App() {
 
         {/* Dev only: skip the camera + backend and load a canned table */}
         {import.meta.env.DEV && (
-          <button
-            type="button"
-            onClick={loadTestTable}
-            className="rounded-xl border border-dashed border-stone-400 px-5 py-2 text-sm font-semibold text-stone-600 dark:text-stone-400"
-          >
-            Load test table
-          </button>
+          <div className="grid grid-cols-2 gap-2">
+            {[false, true].map(teams => (
+              <button
+                key={String(teams)}
+                type="button"
+                onClick={() => loadTestTable(teams)}
+                className="rounded-xl border border-dashed border-stone-400 px-3 py-2 text-sm font-semibold text-stone-600 dark:text-stone-400"
+              >
+                {teams ? 'Test table (teams)' : 'Load test table'}
+              </button>
+            ))}
+          </div>
         )}
 
         {game && (
           <>
-            <Scoreboard game={game} />
+            <Scoreboard game={game} up={turns?.up ?? null} />
 
             {view?.shot ? (
               <p className="rounded-lg bg-white px-4 py-3 text-sm shadow-sm dark:bg-stone-900">
@@ -573,13 +667,16 @@ export default function App() {
                 label={
                   busy && status.what === 'Reading the table…'
                     ? status.what
-                    : photoCount === 0 ? 'Photo of the table' : `Photo after ${player?.name}’s shot`
+                    : photoCount === 0 ? 'Photo of the table' : `Photo after ${shooterName}’s shot`
                 }
               />
             )}
             {photoCount > 0 && (
               <PhotoButton disabled={busy} onFile={f => handlePhoto(f, true)} label="Retake the last photo" />
             )}
+
+            {/* No table to show yet (or the game's over): the gutter goes where it would be */}
+            {!(view && game.winner == null) && gutterPanel()}
 
             {view && game.winner == null && (
               <section className="flex flex-col gap-2">
@@ -605,24 +702,55 @@ export default function App() {
 
                 {/* .table-stage goes full screen in phone landscape (see index.css) */}
                 <div
-                  className="table-stage"
+                  className="table-stage relative"
                   style={{ '--table-aspect': (view.table.width + RAIL * 2) / (view.table.height + RAIL * 2) } as React.CSSProperties}
                 >
-                  <TableCanvas
-                    data={view}
-                    shots={shown.map(i => shots[i])}
-                    selected={shown.indexOf(selected)}
-                    showConfidence={!confirmed}
-                    highlight={picking}
-                    onBallTap={confirmed ? undefined : onBallTap}
-                    onShotTap={confirmed ? i => setSelected(shown[i]) : undefined}
-                  />
-                  {confirmed ? (
-                    <div className="stage-tools">
-                      <ShotGuide vertical guide={guide} />
+                  <div className="stage-main">
+                    <TableCanvas
+                      data={view}
+                      shots={shown.map(i => shots[i])}
+                      selected={shown.indexOf(selected)}
+                      showConfidence={!confirmed}
+                      highlight={picking}
+                      onBallTap={confirmed ? undefined : onBallTap}
+                      onShotTap={confirmed ? i => setSelected(shown[i]) : undefined}
+                      onTableTap={placing == null ? undefined : placeBall}
+                    />
+                    <div className="stage-gutter">{gutterPanel(true)}</div>
+                  </div>
+                  {placing != null && (
+                    <div className="absolute inset-x-0 top-2 z-10 flex justify-center px-2">
+                      <p role="status" className="flex items-center gap-3 rounded-full bg-stone-950/85 py-1.5 pr-1.5 pl-4 text-sm font-semibold text-white shadow-lg">
+                        Tap where the {placing === 0 ? 'cue ball' : placing} is
+                        <button
+                          type="button"
+                          onClick={() => setPlacing(null)}
+                          className="rounded-full bg-white/15 px-3 py-1.5 active:bg-white/25"
+                        >
+                          Cancel
+                        </button>
+                      </p>
                     </div>
-                  ) : (
-                    <div className="stage-tools">
+                  )}
+                  {/* The page's error message is hidden behind full screen: repeat it here */}
+                  {status.kind === 'error' && placing == null && (
+                    <div className="stage-only absolute inset-x-0 top-2 z-10 flex justify-center px-2">
+                      <p role="alert" className="flex max-w-md items-center gap-3 rounded-2xl bg-red-900/95 py-1.5 pr-1.5 pl-4 text-sm font-medium text-white shadow-lg">
+                        {status.message}
+                        <button
+                          type="button"
+                          onClick={() => setStatus({ kind: 'idle' })}
+                          className="shrink-0 rounded-full bg-white/15 px-3 py-1.5 font-semibold active:bg-white/25"
+                        >
+                          OK
+                        </button>
+                      </p>
+                    </div>
+                  )}
+                  <div className="stage-tools">
+                    {confirmed ? (
+                      <ShotGuide vertical guide={guide} />
+                    ) : (
                       <EditToolbar
                         vertical
                         tool={tool}
@@ -633,9 +761,17 @@ export default function App() {
                         onRedo={redo}
                         onConfirm={confirmLayout}
                       />
-                    </div>
-                  )}
+                    )}
+                    <CameraButton
+                      busy={busy && status.what === 'Reading the table…'}
+                      disabled={busy}
+                      label={photoCount === 0 ? 'Photo of the table' : `Photo after ${shooterName}’s shot`}
+                      onFile={f => handlePhoto(f, false)}
+                    />
+                  </div>
                 </div>
+
+                {gutterPanel()}
 
                 {!confirmed ? (
                   <>
@@ -729,7 +865,7 @@ export default function App() {
 
       {view && picking != null && view.balls[picking] && (
         <BallPicker
-          ball={view.balls[picking]}
+          current={view.balls[picking].type === 'cue' ? 0 : view.balls[picking].id}
           unavailable={sunk}
           onPick={onPick}
           onClose={() => setPicking(null)}

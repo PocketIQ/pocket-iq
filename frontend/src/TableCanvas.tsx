@@ -80,7 +80,7 @@ type Press = {
   pointerId: number
   x: number
   y: number
-  target: { kind: 'ball' | 'shot'; index: number }
+  target: { kind: 'ball' | 'shot' | 'table'; index: number }
   moved: boolean
 }
 
@@ -118,6 +118,7 @@ export function TableCanvas({
   highlight = null,
   onBallTap,
   onShotTap,
+  onTableTap,
 }: {
   data: AnalyzeResponse
   shots?: Shot[]
@@ -128,6 +129,8 @@ export function TableCanvas({
   onBallTap?: (index: number) => void
   /** Tapping a shot's line: index into `shots`. Used when balls aren't editable. */
   onShotTap?: (index: number) => void
+  /** Tap anywhere on the cloth (wins over onBallTap), in table units: placing a ball. */
+  onTableTap?: (x: number, y: number) => void
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
   const press = useRef<Press | null>(null)
@@ -136,9 +139,12 @@ export function TableCanvas({
     if (e.button !== 0) return
     const canvas = ref.current
     if (!canvas) return
-    const ball = onBallTap ? ballIndexAt(data, canvas, e.clientX, e.clientY) : null
-    const shot = ball == null && onShotTap ? shotIndexAt(data, shots, canvas, e.clientX, e.clientY) : null
-    const target = ball != null ? { kind: 'ball' as const, index: ball } : shot != null ? { kind: 'shot' as const, index: shot } : null
+    // Placing a ball: any tap on the cloth counts. Otherwise a ball, then a shot's line.
+    const ball = !onTableTap && onBallTap ? ballIndexAt(data, canvas, e.clientX, e.clientY) : null
+    const shot = !onTableTap && ball == null && onShotTap ? shotIndexAt(data, shots, canvas, e.clientX, e.clientY) : null
+    const target = onTableTap
+      ? { kind: 'table' as const, index: -1 }
+      : ball != null ? { kind: 'ball' as const, index: ball } : shot != null ? { kind: 'shot' as const, index: shot } : null
     if (!target) return
     e.preventDefault()
     try {
@@ -160,7 +166,15 @@ export function TableCanvas({
     if (!current || current.pointerId !== e.pointerId) return
     press.current = null
     if (!tap || current.moved) return
-    if (current.target.kind === 'ball') onBallTap?.(current.target.index)
+    const canvas = ref.current
+    if (current.target.kind === 'table') {
+      if (!canvas || !onTableTap) return
+      // Keep the whole ball on the cloth
+      const { tx, ty } = toTable(data, canvas, e.clientX, e.clientY)
+      const r = data.ball_radius
+      const clamp = (v: number, max: number) => Math.min(Math.max(v, r), max - r)
+      onTableTap(clamp(tx, data.table.width), clamp(ty, data.table.height))
+    } else if (current.target.kind === 'ball') onBallTap?.(current.target.index)
     else onShotTap?.(current.target.index)
   }
 
@@ -194,6 +208,26 @@ export function TableCanvas({
       ctx.translate(RAIL, RAIL)
       ctx.fillStyle = '#17643f'
       ctx.fillRect(0, 0, TW, TH)
+
+      // Diamonds: 3 evenly spaced sights between each pair of pockets, along the middle of the rails
+      const mid = RAIL / 2
+      const sights: [number, number, boolean][] = [] // x, y, on a long rail
+      for (const k of [1, 2, 3, 5, 6, 7]) sights.push([(TW * k) / 8, -mid, true], [(TW * k) / 8, TH + mid, true])
+      for (const k of [1, 2, 3]) sights.push([-mid, (TH * k) / 4, false], [TW + mid, (TH * k) / 4, false])
+      ctx.fillStyle = '#d6d9de'
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)'
+      ctx.lineWidth = 1
+      for (const [x, y, long] of sights) {
+        const [w, h] = long ? [9, 5] : [5, 9] // half-sizes, longer along the rail
+        ctx.beginPath()
+        ctx.moveTo(x - w, y)
+        ctx.lineTo(x, y - h)
+        ctx.lineTo(x + w, y)
+        ctx.lineTo(x, y + h)
+        ctx.closePath()
+        ctx.fill()
+        ctx.stroke()
+      }
 
       // Pockets: 4 corners + 2 side
       ctx.fillStyle = '#0a0a0a'

@@ -36,6 +36,15 @@ export interface ShotEvent {
   advice: { target_ball: number | null; pocket: string | null; made: boolean } | null
 }
 
+/** One pocketed ball, in the order they went in. */
+export interface GutterEntry {
+  ball: number // 1-15
+  by: 0 | 1 | null // index into players it counts for; null = no one (the break, or not counted)
+  member: string | null // team mode: which teammate (the app sets it; the backend only knows sides)
+  photo: number | null // the photo whose shot pocketed it; null = added by hand
+  open: boolean // the table was still open, so it can't be the wrong group's ball
+}
+
 export interface Game {
   id: string
   players: [Player, Player]
@@ -43,6 +52,7 @@ export interface Game {
   winner: 0 | 1 | null
   balls: Record<string, 'on' | 'sunk'> // "cue", "1".."15"
   history: ShotEvent[]
+  gutter: GutterEntry[]
   // The latest photo's layout (what the correction editor shows); null before the first photo
   layout: { n: number; balls: Ball[]; intended: IntendedShot | null } | null
 }
