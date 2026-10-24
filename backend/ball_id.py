@@ -34,7 +34,7 @@ letter. For every tile, say what it is.
 Ball colors: 1 yellow, 2 blue, 3 red, 4 purple, 5 orange, 6 green, 7 maroon (dark red),
 8 black. 9-15 are the same colors as 1-7 but white with a colored band (stripes):
 9 yellow, 10 blue, 11 red, 12 purple, 13 orange, 14 green, 15 maroon. The cue ball is plain white.
-If it isn't a pool ball (chalk, paper, a hand, a pocket, a marker, glare), say not_a_ball.
+If it isn't a pool ball (chalk, paper, tape, a hand, a pocket, glare), say not_a_ball.
 Give number null if you can't tell which number it is. confidence is 0 to 1."""
 
 SCHEMA = {

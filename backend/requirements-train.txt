@@ -1,0 +1,7 @@
+# Only for training the ball detector (tools/train_yolo.py). The server doesn't need
+# these: it runs the exported ONNX model with OpenCV.
+#   pip install -r requirements-train.txt   (inside your venv; pulls in PyTorch, ~1 GB)
+-r requirements.txt
+ultralytics             # YOLOv8 training + ONNX export (brings torch)
+onnx                    # needed by the ONNX export
+onnxslim                # simplifies the exported graph (export(simplify=True))

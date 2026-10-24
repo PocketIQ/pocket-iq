@@ -46,10 +46,11 @@ async def _read_photo(photo: UploadFile) -> np.ndarray:
     return img
 
 
-def _vision(img: np.ndarray) -> tuple[list[dict], list[dict]]:
-    """CV finds the balls, Gemini double-checks what each one is. Returns (balls, not-balls)."""
+def _vision(img: np.ndarray, allowed: set[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """CV finds the balls, Gemini double-checks what each one is. Returns (balls, not-balls).
+    allowed: the balls still in play, so vision never names a pocketed one."""
     try:
-        result = analyze_image(img)
+        result = analyze_image(img, allowed)
     except VisionError as e:
         # 422 = "I understood the request but can't use this photo". Frontend shows the message.
         raise HTTPException(422, str(e))
@@ -190,6 +191,7 @@ def _photo_result(state: dict, result: dict, not_balls: list[dict] = ()) -> dict
         "balls": result["balls"],
         "missing": result["missing"],
         "rejected": result["rejected"] + list(not_balls),
+        "revived": result.get("revived", []),
         "shot": result["shot"],
         "game": game.public(state),
     }
@@ -216,6 +218,9 @@ async def analyze_in_game(
         meant = Intended.model_validate_json(intended).model_dump() if intended else None
     except ValidationError as e:
         raise HTTPException(422, f"`intended` isn't a valid shot: {e.errors()[0]['msg']}")
+    # Vision names balls freely (all 16); the game's memory decides. Restricting names to
+    # balls in play hid a ball that one bad photo had wrongly marked pocketed: this way
+    # it's seen again and brought back (game.revive).
     balls, not_balls = _vision(await _read_photo(photo))
     try:
         if retake:
@@ -267,6 +272,9 @@ def simulate(game_id: str, body: SimulateRequest):
     state = _load(game_id)
     group = state["players"][state["turn"]]["group"]
     balls = physics.balls_from_state(state)
+    if state.get("ball_in_hand"):
+        raise HTTPException(409, "Ball in hand: place the cue ball (see /plan/ball-in-hand) "
+                                 "and take a photo, then simulate from there.")
     if not any(b["type"] == "cue" for b in balls):
         raise HTTPException(409, "The cue ball hasn't been seen yet. Take a photo of the table first.")
     shot = physics.match_shot(balls, group, body.target_id, body.pocket, body.kind, body.cut_angle)
@@ -298,6 +306,26 @@ def plan_shot(body: PlanRequest):
         return {"physics": None, "speed": None, "spin_name": None}
     return {"physics": physics.plan_json(p), "speed": physics.speed_word(p.power),
             "spin_name": physics.spin_word(p.spin)}
+
+
+class HandRequest(BaseModel):
+    """A layout after a scratch: where should the cue ball go? Its old spot is ignored."""
+    balls: list[PlanBall] = Field(max_length=16)
+    group: str | None = None             # the shooter's group; null = open table
+
+
+@app.post("/plan/ball-in-hand")
+def plan_ball_in_hand(body: HandRequest):
+    """
+    Ball in hand (after the opponent scratched): the best spot for the cue ball, the shot
+    from there, and its power, spin and cue ball path. Physics only, like /plan. Every
+    field is null if no spot gives a makeable shot (play safe).
+    """
+    h = physics.ball_in_hand([b.model_dump() for b in body.balls], body.group)
+    if h is None:
+        return {"cue": None, "target_ball": None, "pocket": None, "kind": None, "cut_angle": None,
+                "physics": None, "speed": None, "spin_name": None}
+    return physics.hand_json(h)
 
 
 @app.get("/games/{game_id}/advice/audio")
