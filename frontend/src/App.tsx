@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { adviceAudioUrl, analyzeGamePhoto, correctLayout, createGame, getAdvice, getGame } from './api'
 import { BallPicker } from './BallPicker'
+import { Banner } from './Banner'
 import { EditToolbar } from './EditToolbar'
-import { MOCK_TABLE } from './mockTable'
+import { Gutter } from './Gutter'
+import { applyEdits, deriveGutter, loadEdits, NO_EDITS, saveEdits, type GutterEdits } from './gutterBalls'
+import { MOCK_ROSTERS, MOCK_TABLE, mockGame } from './mockTable'
 import { findShots, type Shot } from './physics/shots'
 import { resizeImage } from './resizeImage'
+import { Setup } from './Setup'
 import { RAIL, TableCanvas } from './TableCanvas'
+import { loadRosters, saveRosters, SIDE_COLORS, teamTurns, type Rosters } from './teams'
 import type { Tool } from './EditToolbar'
 import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, IntendedShot, LayoutBall, ShotEvent } from './types'
 
@@ -21,16 +26,7 @@ const GAME_KEY = 'cueiq.game' // resume the game after a reload
 const SHOTS_SHOWN = 3
 const SHOTS_TO_COACH = 8
 
-// Dev only: a local game for the test table, so the editor works without the backend.
-const DEV_GAME: Game = {
-  id: 'dev',
-  players: [{ name: 'You', group: null }, { name: 'Friend', group: null }],
-  turn: 0,
-  winner: null,
-  balls: Object.fromEntries(['cue', ...Array.from({ length: 15 }, (_, i) => String(i + 1))].map(b => [b, 'on'])),
-  history: [],
-  layout: null,
-}
+const DEV_GAME_ID = 'dev' // the test table's local game: no backend
 
 function errorMessage(err: unknown): string {
   return err instanceof TypeError
@@ -91,41 +87,7 @@ function difficultyLabel(difficulty: number): string {
   return 'Hard'
 }
 
-function Setup({ onStart, busy }: { onStart: (names: [string, string]) => void; busy: boolean }) {
-  const [names, setNames] = useState<[string, string]>(['', ''])
-  return (
-    <form
-      className="flex flex-col gap-3"
-      onSubmit={e => {
-        e.preventDefault()
-        onStart(names)
-      }}
-    >
-      <p className="text-sm text-stone-600 dark:text-stone-400">
-        8-ball, two players. The coach remembers each player across games, so use the same names next time.
-      </p>
-      {[0, 1].map(i => (
-        <label key={i} className="flex flex-col gap-1 text-sm font-medium">
-          {i === 0 ? 'Player 1 (breaks)' : 'Player 2'}
-          <input
-            required
-            value={names[i]}
-            onChange={e => setNames(n => (i === 0 ? [e.target.value, n[1]] : [n[0], e.target.value]))}
-            className="rounded-lg border border-stone-300 bg-white px-3 py-2 text-base dark:border-stone-700 dark:bg-stone-900"
-          />
-        </label>
-      ))}
-      <button
-        disabled={busy}
-        className="rounded-xl bg-emerald-700 px-5 py-3 text-lg font-semibold text-white active:bg-emerald-800 disabled:opacity-60"
-      >
-        {busy ? 'Starting…' : 'Start game'}
-      </button>
-    </form>
-  )
-}
-
-function Scoreboard({ game }: { game: Game }) {
+function Scoreboard({ game, up }: { game: Game; up: string | null }) {
   return (
     <div className="grid grid-cols-2 gap-2">
       {game.players.map((p, i) => {
@@ -134,18 +96,20 @@ function Scoreboard({ game }: { game: Game }) {
             ([b, s]) => s === 'on' && b !== 'cue' && b !== '8' && (Number(b) < 8) === (p.group === 'solid'),
           ).length
           : null
-        const up = game.winner == null && game.turn === i
+        const isUp = game.winner == null && game.turn === i
+        const shooter = isUp ? up : null
         return (
           <div
             key={p.name}
-            className={`rounded-lg px-3 py-2 ${up ? 'bg-emerald-700 text-white' : 'bg-stone-200 dark:bg-stone-800'}`}
+            className={`rounded-lg px-3 py-2 ${isUp ? 'bg-emerald-700 text-white' : 'bg-stone-200 dark:bg-stone-800'}`}
           >
-            <div className="font-semibold">
-              {p.name} {game.winner === i && '🏆'}
+            <div className="flex items-center gap-1.5 font-semibold">
+              <span className="size-2.5 shrink-0 rounded-full ring-1 ring-black/20" style={{ background: SIDE_COLORS[i] }} aria-hidden="true" />
+              <span className="truncate">{p.name}</span> {game.winner === i && '🏆'}
             </div>
             <div className="text-xs opacity-80">
               {p.group ? `${p.group}s · ${left} left` : 'open table'}
-              {up && ' · your shot'}
+              {isUp && (shooter ? ` · ${shooter}’s shot` : ' · your shot')}
             </div>
           </div>
         )
@@ -267,9 +231,11 @@ export default function App() {
   const [coach, setCoach] = useState<Coach>({ kind: 'idle' })
   const [adviceCount, setAdviceCount] = useState(0) // new audio URL per piece of advice
   const coachRequest = useRef(0) // bumped to drop advice for a layout that's since changed
+  const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
+  const [gutterEdits, setGutterEdits] = useState<GutterEdits>(NO_EDITS)
 
   const busy = status.kind === 'loading'
-  const devMode = game?.id === DEV_GAME.id
+  const devMode = game?.id === DEV_GAME_ID
 
   // Resume the last game after a reload.
   useEffect(() => {
@@ -283,12 +249,20 @@ export default function App() {
       getGame(id)
         .then(g => {
           setGame(g)
+          setRosters(loadRosters(g.id))
+          setGutterEdits(loadEdits(g.id))
           loadView(viewFromLayout(g))
         })
         .catch(() => localStorage.removeItem(GAME_KEY))
   }, [])
 
   const player = game ? game.players[game.turn] : null
+  const turns = useMemo(() => (game ? teamTurns(game, rosters) : null), [game, rosters])
+  const shooterName = turns?.up ?? player?.name // in team mode, the teammate who's up
+  const gutter = useMemo(
+    () => (game && turns ? applyEdits(game, deriveGutter(game, turns.byShot), gutterEdits) : []),
+    [game, turns, gutterEdits],
+  )
   const shots = useMemo(
     () => (view && player && confirmed ? findShots(view.balls, view.table, view.ball_radius, player.group) : []),
     [view, player, confirmed],
@@ -325,7 +299,7 @@ export default function App() {
     resetCoach()
   }
 
-  async function start(names: [string, string]) {
+  async function start(names: [string, string], teams: Rosters) {
     const g = await run('Starting…', () => createGame(names))
     if (!g) return
     try {
@@ -333,14 +307,25 @@ export default function App() {
     } catch {
       /* resuming after reload just won't work */
     }
+    saveRosters(g.id, teams)
     setGame(g)
+    setRosters(teams)
+    setGutterEdits(NO_EDITS)
     loadView(null)
   }
 
-  function loadTestTable() {
-    setGame(DEV_GAME)
+  function loadTestTable(teams: boolean) {
+    const g = mockGame(teams)
+    setGame(g)
+    setRosters(teams ? MOCK_ROSTERS : null)
+    setGutterEdits(NO_EDITS)
     setStatus({ kind: 'idle' })
-    loadView({ ...structuredClone(MOCK_TABLE), missing: [], rejected: [], shot: null, game: DEV_GAME })
+    loadView({ ...structuredClone(MOCK_TABLE), missing: [], rejected: [], shot: null, game: g })
+  }
+
+  function editGutter(edits: GutterEdits) {
+    setGutterEdits(edits)
+    if (game && !devMode) saveEdits(game.id, edits)
   }
 
   // Every photo after the first shows the result of the shot before it: the backend
@@ -454,6 +439,8 @@ export default function App() {
       /* nothing to forget */
     }
     setGame(null)
+    setRosters(null)
+    setGutterEdits(NO_EDITS)
     loadView(null)
   }
 
@@ -465,20 +452,12 @@ export default function App() {
 
   return (
     <main className="min-h-dvh bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
-      <div className="mx-auto max-w-2xl px-4 py-6 flex flex-col gap-5">
-        <header className="flex items-start justify-between gap-3">
-          <div>
-            <h1 className="text-2xl font-bold">PocketIQ</h1>
-            <p className="text-sm text-stone-600 dark:text-stone-400">
-              After every shot, once the balls stop, snap the whole table before anyone touches it.
-            </p>
-          </div>
-          {game && (
-            <button onClick={newGame} className="shrink-0 py-1 text-sm text-stone-500 underline">
-              New game
-            </button>
-          )}
-        </header>
+      <Banner onNewGame={game ? newGame : undefined} />
+      <div className="mx-auto max-w-2xl px-4 py-5 flex flex-col gap-5">
+        <h1 className="sr-only">PocketIQ</h1>
+        <p className="-mb-2 text-sm text-stone-600 dark:text-stone-400">
+          After every shot, once the balls stop, snap the whole table before anyone touches it.
+        </p>
 
         {status.kind === 'error' && (
           <p role="alert" className="rounded-lg bg-red-100 px-4 py-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-200">
@@ -490,18 +469,24 @@ export default function App() {
 
         {/* Dev only: skip the camera + backend and load a canned table */}
         {import.meta.env.DEV && (
-          <button
-            type="button"
-            onClick={loadTestTable}
-            className="rounded-xl border border-dashed border-stone-400 px-5 py-2 text-sm font-semibold text-stone-600 dark:text-stone-400"
-          >
-            Load test table
-          </button>
+          <div className="grid grid-cols-2 gap-2">
+            {[false, true].map(teams => (
+              <button
+                key={String(teams)}
+                type="button"
+                onClick={() => loadTestTable(teams)}
+                className="rounded-xl border border-dashed border-stone-400 px-3 py-2 text-sm font-semibold text-stone-600 dark:text-stone-400"
+              >
+                {teams ? 'Test table (teams)' : 'Load test table'}
+              </button>
+            ))}
+          </div>
         )}
 
         {game && (
           <>
-            <Scoreboard game={game} />
+            <Scoreboard game={game} up={turns?.up ?? null} />
+            <Gutter game={game} rosters={rosters} balls={gutter} edits={gutterEdits} onEdits={editGutter} />
 
             {view?.shot ? (
               <p className="rounded-lg bg-white px-4 py-3 text-sm shadow-sm dark:bg-stone-900">
@@ -529,7 +514,7 @@ export default function App() {
                 label={
                   busy && status.what === 'Reading the table…'
                     ? status.what
-                    : photoCount === 0 ? 'Photo of the table' : `Photo after ${player?.name}’s shot`
+                    : photoCount === 0 ? 'Photo of the table' : `Photo after ${shooterName}’s shot`
                 }
               />
             )}
@@ -672,7 +657,7 @@ export default function App() {
 
       {view && picking != null && view.balls[picking] && (
         <BallPicker
-          ball={view.balls[picking]}
+          current={view.balls[picking].type === 'cue' ? 0 : view.balls[picking].id}
           unavailable={sunk}
           onPick={onPick}
           onClose={() => setPicking(null)}
