@@ -1,0 +1,24 @@
+# CueIQ backend — everything Person A needs for the whole project.
+# Install:  pip install -r requirements.txt   (inside your venv)
+
+# --- Web server ---
+fastapi                 # the API framework
+uvicorn[standard]       # runs the FastAPI app
+python-multipart        # lets FastAPI receive uploaded photos
+
+# --- Computer vision ---
+opencv-contrib-python-headless   # OpenCV + the ArUco marker module ("headless" = no GUI, works on servers)
+numpy                            # array math OpenCV is built on
+
+# --- AI ---
+google-genai            # official Gemini SDK (vision fallback + coaching)
+httpx                   # HTTP client for calling the Backboard API
+
+# --- Database ---
+pymongo                 # MongoDB Atlas driver (supports mongodb+srv:// out of the box)
+
+# --- Auth ---
+pyjwt[crypto]           # verifies Auth0 login tokens sent from the frontend
+
+# --- Config ---
+python-dotenv           # loads API keys from a .env file so they never get committed
