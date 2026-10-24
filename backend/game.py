@@ -8,6 +8,10 @@ The table state here is AUTHORITATIVE. Vision only proposes; this decides:
   so a detection that looks like one gets matched to a ball still in play, or rejected.
 - Detections left over after matching are rejected as false detections (glare, chalk,
   a hand...). There can't be more balls than the table has left.
+- Except: a leftover detection that clearly IS a pocketed ball (vision is sure of its
+  number) means that ball was only missed in an earlier photo. It comes back on the
+  table, and the shot that "pocketed" it is corrected (revive). One bad photo shouldn't
+  take a ball out of the game for good.
 
 Shots are worked out from consecutive photos (process_photo): take a photo, shoot, take
 the next photo. A ball seen in the last photo and gone from this one went in; the cue
@@ -17,6 +21,11 @@ retake). Balls not seen in EITHER photo stay in play: probably hidden, not pocke
 Every photo can be corrected (the frontend's layout editor): the game rewinds to just
 before that photo and replays it with the fixed layout (replace_photo), so a mistaken
 "pocketed" never sticks.
+
+The first photo is the racked table (all 15 balls plus the cue ball) and the next shot
+is the break. A scratch gives the other player ball in hand: `ball_in_hand` stays set
+until the cue ball shows up in a photo again or the next shot is played, and the coach
+places the cue ball (physics.ball_in_hand) instead of using its old spot.
 """
 import copy
 import math
@@ -31,7 +40,9 @@ STRIPES = tuple(range(9, 16))
 MATCH_MAX_COST = 1.6
 MOVE_SCALE = 300          # table units; a ball this far from its last spot costs +0.5
 FLAG_COST = 0.6           # matches costlier than this get flagged for the user to confirm
+REVIVE_CONFIDENCE = 0.7   # how sure vision must be of a pocketed ball's number to bring it back
 UNSEEN_COST = 0.25        # position cost for a ball we have never seen yet
+FOOT_SPOT = (750.0, 250.0)   # where a ball is spotted (the 8 pocketed on the break)
 # Between two photos, if no ball moved more than this (table units), no shot was taken.
 # Covers the jitter of shooting the same layout from a different spot.
 MOVE_EPS = 20
@@ -67,6 +78,7 @@ def new_game(players: list[str]) -> dict:
         "photos": 0,                 # photos processed so far
         "photo": None,               # the latest photo's layout (what the editor shows)
         "undo": None,                # the state just before the latest photo, for corrections
+        "ball_in_hand": False,       # after a scratch: the shooter may place the cue ball anywhere
     }
 
 
@@ -141,27 +153,61 @@ def reconcile(state: dict, detections: list[dict]) -> dict:
             "id": None if b == "cue" else int(b), "type": ball_type(b),
             "x": d["x"], "y": d["y"], "confidence": round(float(conf), 2),
         })
+    revived = []
+    for di, d in enumerate(detections):
+        b = None if di in used_det or d.get("id") is None else str(d["id"])
+        if b and b in state["balls"] and state["balls"][b]["status"] == "sunk" and b not in revived \
+                and d["type"] == ball_type(b) and d["confidence"] >= REVIVE_CONFIDENCE \
+                and not (b == "8" and state["winner"] is not None):
+            revive(state, b, d["x"], d["y"])
+            used_det.add(di)
+            revived.append(b)
+            # Flagged: the player should glance at it, since it changes an earlier shot.
+            balls.append({"id": int(b), "type": ball_type(b), "x": d["x"], "y": d["y"],
+                          "confidence": round(min(float(d["confidence"]), 0.5), 2)})
     return {
         "balls": balls,
         # Unmatched balls keep their last position, so x is set only if seen before.
         "missing": [b for b in live if b not in used_ball and state["balls"][b]["x"] is not None],
         "rejected": [d for di, d in enumerate(detections) if di not in used_det],
+        "revived": [int(b) for b in revived],
     }
+
+
+def revive(state: dict, b: str, x: float, y: float) -> None:
+    """A ball marked pocketed turned up on the table: it was only missed in an earlier
+    photo. Put it back in play and take it out of the shot that "pocketed" it. That shot's
+    other effects (whose turn, groups) stand: the game moved on since, and a later
+    correction in the editor is the way to change them."""
+    state["balls"][b].update(status="on", x=x, y=y, seen=True)
+    n = int(b)
+    for e in reversed(state["history"]):
+        if n in e["pocketed"]:
+            e["pocketed"] = [p for p in e["pocketed"] if p != n]
+            e.setdefault("revived", []).append(n)
+            if e.get("intended") and e["intended"].get("target") == n:
+                e["made"] = False
+            break
 
 
 def place(state: dict, layout: list[dict]) -> dict:
     """
     Like reconcile, but for a layout the player corrected: every ball's identity is given
     ({"id": 1-15, or null with "type": "cue"}), so it's trusted as-is. Same return shape.
+    A ball marked pocketed earlier that the player put in the layout comes back (revive).
     """
     live = set(on_table(state))
-    balls, used = [], set()
+    balls, used, revived = [], set(), []
     for item in layout:
         b = "cue" if item.get("type") == "cue" or item.get("id") is None else str(item["id"])
         if b not in state["balls"]:
             raise GameError(f"There's no ball {item.get('id')}.")
         if b not in live:
-            raise GameError(f"Ball {b} was already pocketed in an earlier shot.")
+            if b == "8" and state["winner"] is not None:
+                raise GameError("The 8 was pocketed and the game is over. Start a new one.")
+            if b not in used:
+                revive(state, b, float(item["x"]), float(item["y"]))
+                revived.append(int(b))
         if b in used:
             raise GameError(f"Ball {'cue' if b == 'cue' else b} is in the layout twice.")
         used.add(b)
@@ -174,6 +220,7 @@ def place(state: dict, layout: list[dict]) -> dict:
         "balls": balls,
         "missing": [b for b in live if b not in used and state["balls"][b]["x"] is not None],
         "rejected": [],
+        "revived": revived,
     }
 
 
@@ -200,18 +247,25 @@ def process_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     before = {b: (state["balls"][b]["x"], state["balls"][b]["y"])
               for b in live if state["balls"][b]["seen"]}
 
+    in_hand = state.get("ball_in_hand", False)
     seen = place(state, detections) if corrected else reconcile(state, detections)
     now = {b for b in live if state["balls"][b]["seen"]}
     gone = [b for b in before if b not in now]
     pocketed = sorted(int(b) for b in gone if b != "cue")
-    scratch = "cue" in gone
     moved = max((math.hypot(state["balls"][b]["x"] - x, state["balls"][b]["y"] - y)
                  for b, (x, y) in before.items() if b in now), default=0.0)
+    shot_taken = bool(pocketed) or moved > MOVE_EPS
+    # Normally a scratch is the cue ball vanishing between photos. With ball in hand the
+    # last photo had no cue ball (it was in the pocket), so: a shot was played and the cue
+    # ball still isn't on the table.
+    scratch = "cue" in gone or (in_hand and shot_taken and "cue" not in now)
 
     shot = None
-    if not first and state["winner"] is None and (pocketed or scratch or moved > MOVE_EPS):
+    if not first and state["winner"] is None and (shot_taken or scratch):
         shot = apply_shot(state, pocketed, scratch, intended)
         shot["photo"] = state["photos"] + 1
+    elif in_hand and "cue" in now:
+        state["ball_in_hand"] = False     # placed and photographed: plan from where it is
     state["photos"] += 1
     state["photo"] = {"n": state["photos"], "balls": seen["balls"], "intended": intended}
     return {**seen, "shot": shot}
@@ -241,10 +295,13 @@ def replace_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
 def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict | None = None) -> dict:
     """
     Record the shot the current player just took (8-ball, simplified):
-    - first shot that pockets only one group's balls assigns groups
+    - the first shot of the game is the break: the table stays open whatever goes in,
+      and an 8 pocketed on the break is spotted (put back), not a loss
+    - after that, the first shot that pockets only one group's balls assigns groups
     - pocketing the 8 wins only if your group was already cleared and you didn't scratch
     - you keep shooting if you pocketed one of yours (any object ball on an open table)
       without scratching; otherwise the turn passes
+    - a scratch gives the other player ball in hand
     `intended` is the shot they meant to play ({target, pocket, kind, cut_angle}), if
     known; otherwise the coach's suggestion, if they asked. It's what makes a shot count
     as made or missed in their long-term stats.
@@ -262,12 +319,19 @@ def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict |
     shooter = state["turn"]
     me, opp = state["players"][shooter], state["players"][1 - shooter]
     cleared_before = me["group"] is not None and not remaining(state, me["group"])
+    is_break = not state["history"]
+    spotted = is_break and 8 in pocketed
     for b in pocketed:
+        if spotted and b == 8:
+            state["balls"]["8"].update(x=FOOT_SPOT[0], y=FOOT_SPOT[1])   # back on the foot spot
+            continue
         state["balls"][str(b)]["status"] = "sunk"
 
     objects = [b for b in pocketed if b != 8]
-    if 8 in pocketed:
+    if 8 in pocketed and not spotted:
         state["winner"] = shooter if cleared_before and not scratch else 1 - shooter
+    elif is_break:
+        pass                                     # the table stays open after the break
     elif me["group"] is None and objects and not scratch:
         kinds = {ball_type(b) for b in objects}
         if len(kinds) == 1:                      # both groups in one shot: table stays open
@@ -278,18 +342,23 @@ def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict |
     keeps_turn = state["winner"] is None and not scratch and bool(mine)
     if not keeps_turn and state["winner"] is None:
         state["turn"] = 1 - shooter
+    state["ball_in_hand"] = scratch and state["winner"] is None
 
     advice = state["last_advice"]
     if intended is None and advice and advice.get("target_ball") is not None:
         intended = {"target": advice["target_ball"], "pocket": advice.get("pocket"),
                     "kind": advice.get("kind"), "cut_angle": advice.get("cut_angle")}
     if intended is not None and advice and advice.get("target_ball") == intended.get("target"):
-        intended = {**intended, "speed": advice.get("speed"), "spin": advice.get("spin")}
+        spin_xy = advice.get("spin_xy") or {}
+        intended = {**intended, "speed": advice.get("speed"), "spin": advice.get("spin"),
+                    "power": advice.get("power"), "spin_x": spin_xy.get("x"), "spin_y": spin_xy.get("y")}
     event = {
         "t": time.time(),
         "player": me["name"],
         "pocketed": pocketed,
         "scratch": scratch,
+        "break": is_break,
+        "spotted": [8] if spotted else [],
         "result": ("won" if state["winner"] == shooter else "lost" if state["winner"] is not None
                    else "continues" if keeps_turn else "turn passes"),
         "intended": intended,
@@ -313,6 +382,7 @@ def public(state: dict) -> dict:
         "players": state["players"],
         "turn": state["turn"],
         "winner": state["winner"],
+        "ball_in_hand": state.get("ball_in_hand", False),
         "balls": {b: v["status"] for b, v in state["balls"].items()},
         "history": state["history"][-10:],
         # latest photo: {"n", "balls", "intended"}, or None before the first

@@ -11,8 +11,10 @@ Tiger Data (store.player_stats), so the prompt says things like "makes 82% of cu
 """
 import json
 import logging
+import math
 import os
 
+import physics
 import store
 from game import ball_type, remaining
 
@@ -26,6 +28,12 @@ Pick the shot that gives the best chance to pocket a ball AND leave the cue ball
 position for the next one. Use the stats: steer them away from the shot types they
 keep missing and toward the ones they make, and mention it when it matters. If no
 candidate is reasonable, use shot_index -1 and describe a safety instead.
+Most candidates come with a physics plan: the power (0 to 1) and cue ball spin that
+pocket the ball and leave the best position, where the cue ball ends up, and the next
+shot from there. Prefer shots with a plan. For the shot you pick, describe exactly its
+plan's speed and spin (don't invent different ones), and use its ending spot and next
+shot in cue_ball_after. Spin y is follow (+) or draw (-); spin x is right (+) or left (-)
+english; 1 means the tip half a ball-radius off center.
 Explain like you're standing next to them: concrete, short, no jargon without a hint.
 Your aim, cue_ball_after and tip are read aloud, so write them as spoken sentences."""
 
@@ -106,7 +114,21 @@ def _describe_stats(stats: dict | None) -> list[str]:
     return lines
 
 
-def _describe(state: dict, candidates: list[dict], stats: dict | None) -> str:
+def _describe_plan(plan: dict | None) -> str:
+    if plan is None:
+        return ". Physics: no tried power/spin pockets it reliably."
+    spin = plan["spin"]
+    nxt = plan["next_shot"]
+    after = (f"leaves the {nxt['target_ball']} into {nxt['pocket'].replace('_', ' ')} "
+             f"(cut {nxt['cut_angle']} deg)" if nxt else "leaves no easy next shot")
+    return (f". Plan: power {plan['power']:.2f} ({physics.speed_word(plan['power'])}), "
+            f"{physics.spin_word((spin['x'], spin['y']))} (spin x {spin['x']:+.1f}, y {spin['y']:+.1f}); "
+            f"cue ball ends near ({plan['cue_stop']['x']:.0f}, {plan['cue_stop']['y']:.0f})"
+            f"{', SCRATCH RISK' if plan['scratch'] else ''}, {after}")
+
+
+def _describe(state: dict, candidates: list[dict], stats: dict | None,
+              plans: dict[int, dict], spots: dict[int, dict] | None = None) -> str:
     me = state["players"][state["turn"]]
     opp = state["players"][1 - state["turn"]]
     group = me["group"]
@@ -121,6 +143,8 @@ def _describe(state: dict, candidates: list[dict], stats: dict | None) -> str:
         "of the top and bottom rails. Balls on the table (last seen position):",
     ]
     for b, v in state["balls"].items():
+        if b == "cue" and spots:
+            continue
         if v["status"] == "on" and v["x"] is not None:
             label = "cue ball" if b == "cue" else f"{b} ({ball_type(b)})"
             lines.append(f"  {label} at ({v['x']:.0f}, {v['y']:.0f})")
@@ -133,12 +157,18 @@ def _describe(state: dict, candidates: list[dict], stats: dict | None) -> str:
             called = f", went for the {meant['target']} ({'made' if e['made'] else 'missed'})" if meant else ""
             lines.append(f"  {e['player']}: pocketed {made}{', scratched' if e['scratch'] else ''}"
                          f"{called} -> {e['result']}")
+    if spots:
+        lines.append("BALL IN HAND: the opponent scratched, so the player puts the cue ball anywhere. "
+                     "Each candidate says where to place it; tell them where in aim.")
     lines.append("Candidate shots (difficulty 0 = easy, 1+ = hard):")
     for c in candidates:
         lines.append(
             f"  #{c['index']}: the {c['target_id']} into {c['pocket'].replace('_', ' ')}, "
             f"{c['kind']}, cut {c['cut_angle']:.0f} deg, cue ball travels {c['cue_distance']:.0f}, "
             f"object ball travels {c['target_distance']:.0f}, difficulty {c['difficulty']}"
+            + (f", cue ball placed at ({spots[c['index']]['x']:.0f}, {spots[c['index']]['y']:.0f})"
+               if spots and c["index"] in spots else "")
+            + _describe_plan(plans.get(c["index"]))
         )
     if not candidates:
         lines.append("  (none: no clear shot at a legal ball)")
@@ -181,17 +211,86 @@ def _ask_gemini(prompt: str) -> str:
 
 
 # ------------------------------------------------------------------ advice
+def _plans(state: dict, candidates: list[dict]) -> dict[int, dict]:
+    """Physics plan (power, spin, cue ball path...) for each candidate that one pockets.
+    Empty if the cue ball's position isn't known. Physics only helps the coach: if it
+    fails, advice still works without it."""
+    try:
+        group = state["players"][state["turn"]]["group"]
+        balls = physics.balls_from_state(state)
+        if not any(b["type"] == "cue" for b in balls):
+            return {}
+        out = {}
+        for c in candidates:
+            shot = physics.match_shot(balls, group, c["target_id"], c["pocket"], c["kind"], c["cut_angle"])
+            p = shot and physics.plan(balls, shot, group)
+            if p:
+                out[c["index"]] = physics.plan_json(p)
+        return out
+    except Exception as e:
+        log.warning("physics planning failed: %s", e)
+        return {}
+
+
+def _physics_for(state: dict, chosen: dict, advice: dict, plans: dict[int, dict]) -> dict | None:
+    """Numbers for the spin indicator and power bar: the chosen shot's plan, or, without
+    one, a simulation of the coach's words (`planned: false`)."""
+    if chosen["index"] in plans:
+        return plans[chosen["index"]]
+    try:
+        group = state["players"][state["turn"]]["group"]
+        balls = physics.balls_from_state(state)
+        shot = physics.match_shot(balls, group, chosen["target_id"], chosen["pocket"], chosen["kind"],
+                                  chosen["cut_angle"])
+        if shot is None:
+            return None
+        power = physics.WORD_POWER.get(advice["speed"], 0.3)
+        spin = physics.WORD_SPIN.get(advice["spin"], (0.0, 0.0))
+        return physics.result_json(physics.simulate(balls, shot, power, spin))
+    except Exception as e:
+        log.warning("physics simulation failed: %s", e)
+        return None
+
+
+def _hand_candidates(state: dict) -> tuple[list[dict], dict[int, dict], dict[int, dict]]:
+    """Ball in hand: the frontend's candidates were found from the cue ball's old spot, so
+    the backend makes its own: the best cue ball spots, each with its shot and plan.
+    Returns (candidates, plans by index, cue spot by index)."""
+    group = state["players"][state["turn"]]["group"]
+    balls = physics.balls_from_state(state)         # leaves the cue ball out when in hand
+    candidates, plans, spots = [], {}, {}
+    for i, h in enumerate(physics.ball_in_hand_options(balls, group, 3)):
+        target = balls[h.shot.target_index]
+        candidates.append({
+            "index": i, "target_id": h.shot.target_id, "pocket": h.shot.pocket.name,
+            "kind": h.shot.kind, "cut_angle": round(h.shot.cut, 1),
+            "difficulty": round(h.shot.difficulty, 2),
+            "cue_distance": round(math.dist(h.cue, h.shot.ghost)),
+            "target_distance": round(math.dist((target["x"], target["y"]), h.shot.pocket.mouth)),
+        })
+        plans[i] = physics.plan_json(h.plan)
+        spots[i] = {"x": round(h.cue[0], 1), "y": round(h.cue[1], 1)}
+    return candidates, plans, spots
+
+
 def advise(state: dict, candidates: list[dict]) -> dict:
     """Pick and explain a shot for the player whose turn it is. Sets state['last_advice'];
-    the caller saves the game."""
+    the caller saves the game. With ball in hand, `candidates` is ignored: the backend
+    picks cue ball spots itself, and the advice says where to put it (`ball_in_hand`)."""
     name = state["players"][state["turn"]]["name"]
+    spots: dict[int, dict] = {}
+    if state.get("ball_in_hand"):
+        candidates, plans, spots = _hand_candidates(state)
     try:
         stats = store.player_stats(name)
     except store.StoreError as e:   # stats make advice better; they're not required for it
         log.warning("no stats for %s: %s", name, e)
         stats = None
+    if not state.get("ball_in_hand"):
+        plans = _plans(state, candidates)
     try:
-        advice = _validate(json.loads(_ask_gemini(_describe(state, candidates, stats))), candidates)
+        advice = _validate(json.loads(_ask_gemini(_describe(state, candidates, stats, plans, spots))),
+                           candidates)
     except CoachError:
         raise
     except json.JSONDecodeError as e:
@@ -201,8 +300,22 @@ def advise(state: dict, candidates: list[dict]) -> dict:
         raise CoachError(f"The coach is unavailable right now ({type(e).__name__}: {e}).") from e
 
     chosen = next((c for c in candidates if c["index"] == advice["shot_index"]), None)
-    state["last_advice"] = {**advice, "cut_angle": chosen and chosen["cut_angle"],
-                            "kind": chosen and chosen["kind"]}
+    if spots:
+        plan = plans.get(chosen["index"]) if chosen else None
+    else:
+        plan = _physics_for(state, chosen, advice, plans) if chosen else None
+    # Where to put the cue ball, with ball in hand (None otherwise).
+    advice["ball_in_hand"] = {"cue": spots[chosen["index"]]} if spots and chosen else None
+    if plan and plan["planned"]:
+        # The words always match the numbers the indicator shows.
+        advice["speed"] = physics.speed_word(plan["power"])
+        advice["spin"] = physics.spin_word((plan["spin"]["x"], plan["spin"]["y"]))
+    advice["physics"] = plan
+    state["last_advice"] = {
+        **{k: v for k, v in advice.items() if k != "physics"},   # paths aren't worth storing
+        "cut_angle": chosen and chosen["cut_angle"], "kind": chosen and chosen["kind"],
+        "power": plan and plan["power"], "spin_xy": plan and plan["spin"],
+    }
     return advice
 
 

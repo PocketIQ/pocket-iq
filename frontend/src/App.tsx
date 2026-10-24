@@ -1,17 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { adviceAudioUrl, analyzeGamePhoto, correctLayout, createGame, getAdvice, getGame } from './api'
+import { adviceAudioUrl, analyzeGamePhoto, correctLayout, createGame, getAdvice, getGame, planShot } from './api'
+import type { PlanResponse } from './api'
 import { BallPicker } from './BallPicker'
 import { EditToolbar } from './EditToolbar'
 import { MOCK_TABLE } from './mockTable'
 import { findShots, type Shot } from './physics/shots'
 import { resizeImage } from './resizeImage'
+import { ShotGuide } from './ShotGuide'
+import { guideFromPlan, placeholderGuide } from './spinPower'
 import { RAIL, TableCanvas } from './TableCanvas'
 import type { Tool } from './EditToolbar'
 import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, IntendedShot, LayoutBall, ShotEvent } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading'; what: string } | { kind: 'error'; message: string }
 
-type Coach = { kind: 'idle' } | { kind: 'loading' } | { kind: 'done'; advice: Advice } | { kind: 'error' }
+type Coach =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'done'; advice: Advice }
+  | { kind: 'error' }
+  | { kind: 'off' } // test table
 
 type History = { past: Ball[][]; future: Ball[][] }
 
@@ -68,7 +76,11 @@ function setBall(balls: Ball[], index: number, n: number): Ball[] {
   if (!target) return balls
   const type = n === 0 ? 'cue' : n === 8 ? 'eight' : n < 8 ? 'solid' : 'stripe'
   const id = n === 0 ? null : n
-  if (target.type === type && target.id === id) return balls
+  if (target.type === type && target.id === id) {
+    // Picking the same label confirms it: the ball stops being flagged as unsure.
+    if (target.confidence >= 1) return balls
+    return balls.map((ball, i) => (i === index ? { ...ball, confidence: 1 } : ball))
+  }
   // Each ball exists once: whichever ball had this label swaps to the tapped ball's old one.
   return balls.map((ball, i) => {
     if (i === index) return { ...ball, type, id, confidence: 1 }
@@ -267,6 +279,8 @@ export default function App() {
   const [coach, setCoach] = useState<Coach>({ kind: 'idle' })
   const [adviceCount, setAdviceCount] = useState(0) // new audio URL per piece of advice
   const coachRequest = useRef(0) // bumped to drop advice for a layout that's since changed
+  // Physics plan (spin and power) and the shot it's for: a stale one is simply not shown.
+  const [plan, setPlan] = useState<{ shot: Shot; result: PlanResponse | null } | null>(null)
 
   const busy = status.kind === 'loading'
   const devMode = game?.id === DEV_GAME.id
@@ -293,6 +307,24 @@ export default function App() {
     () => (view && player && confirmed ? findShots(view.balls, view.table, view.ball_radius, player.group) : []),
     [view, player, confirmed],
   )
+
+  // Spin and power come from the physics engine (not Gemini), for whichever shot is selected.
+  const selectedShot = shots[selected]
+  const shooterGroup = player?.group ?? null
+  useEffect(() => {
+    if (!view || !selectedShot || selectedShot.targetId == null) return
+    let live = true
+    planShot(
+      view.balls.map(({ id, type, x, y }) => ({ id, type, x, y })),
+      shooterGroup,
+      { target_id: selectedShot.targetId, pocket: selectedShot.pocket, kind: selectedShot.kind, cut_angle: selectedShot.cutAngle },
+    )
+      .then(result => live && setPlan({ shot: selectedShot, result }))
+      .catch(() => live && setPlan({ shot: selectedShot, result: null }))
+    return () => {
+      live = false
+    }
+  }, [view, selectedShot, shooterGroup])
 
   // Top shots, plus the coach's pick if it isn't one of them.
   const shown = shots.slice(0, SHOTS_SHOWN).map((_, i) => i)
@@ -430,6 +462,11 @@ export default function App() {
     setSelected(0)
     if (currentGame.winner != null) return
 
+    // The coach needs a saved game and Gemini; the test table has neither.
+    if (devMode) {
+      setCoach({ kind: 'off' })
+      return
+    }
     const group = currentGame.players[currentGame.turn].group
     const found = findShots(current.balls, current.table, current.ball_radius, group)
     const request = ++coachRequest.current
@@ -457,6 +494,13 @@ export default function App() {
     loadView(null)
   }
 
+  const guide = !selectedShot
+    ? placeholderGuide('No shot')
+    : plan?.shot !== selectedShot
+      ? placeholderGuide('Planning…')
+      : plan.result
+        ? guideFromPlan(plan.result)
+        : placeholderGuide('Physics unavailable')
   const photoCount = game?.layout?.n ?? 0
   const needsCheck = view ? view.balls.filter(ball => ball.confidence < 0.7).length : 0
   const sunk = new Set(
@@ -545,6 +589,9 @@ export default function App() {
                   </p>
                 )}
 
+                {/* Spin and power take the toolbar's place once the layout is confirmed */}
+                {confirmed && <ShotGuide guide={guide} />}
+
                 {!confirmed && (
                   <EditToolbar
                     tool={tool}
@@ -568,8 +615,13 @@ export default function App() {
                     showConfidence={!confirmed}
                     highlight={picking}
                     onBallTap={confirmed ? undefined : onBallTap}
+                    onShotTap={confirmed ? i => setSelected(shown[i]) : undefined}
                   />
-                  {!confirmed && (
+                  {confirmed ? (
+                    <div className="stage-tools">
+                      <ShotGuide vertical guide={guide} />
+                    </div>
+                  ) : (
                     <div className="stage-tools">
                       <EditToolbar
                         vertical
@@ -617,6 +669,11 @@ export default function App() {
                     {coach.kind === 'error' && (
                       <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 shadow-sm dark:bg-stone-900 dark:text-stone-400">
                         Coach unavailable. Here’s the easiest shot.
+                      </p>
+                    )}
+                    {coach.kind === 'off' && (
+                      <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 shadow-sm dark:bg-stone-900 dark:text-stone-400">
+                        The coach is off for the test table: it needs a real game. Spin and power still come from physics.
                       </p>
                     )}
                     {coach.kind === 'done' && (

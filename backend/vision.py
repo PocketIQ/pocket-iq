@@ -1,59 +1,26 @@
 """
-CueIQ vision pipeline:  photo -> find the felt's outline (or, failing that, ArUco markers)
--> warp to top-down -> find balls -> classify.
+CueIQ vision pipeline:  photo -> find the felt's outline (where the table is) -> find the
+balls in the photo, mapped onto the table -> name them all at once.
 
 Every number you'll want to tune is in the CONFIG block. Run tools/debug_vision.py on
 real photos to see what each stage produces before touching anything else.
 """
+import logging
+import os
 from dataclasses import dataclass
 from itertools import combinations
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+log = logging.getLogger("cueiq.vision")
 
 # ------------------------------------------------------------------ CONFIG
 TABLE_W, TABLE_H = 1000, 500          # table coordinate system (CONTRACT.md)
 BALL_RADIUS = 11                      # in table units
 
-# Distance from each marker's CENTER to the felt edge, in table units, along each axis.
-# On a 7ft table (playing area ~78in long) 1 unit ≈ 0.078in, so a marker centered
-# ~2.5in outside the felt ≈ 32 units. MEASURE YOUR TABLE.
-MARKER_OFFSET = 32
-_m, _W, _H = MARKER_OFFSET, TABLE_W, TABLE_H
-
-# Marker ID -> (name, where its center sits in table coordinates).
-# One marker behind each of the 6 pockets. Corner markers sit diagonally behind the
-# pocket; side markers sit straight back from the side pocket. Add or remove entries
-# freely: the warp uses whatever markers it finds (see MIN_MARKERS / MIN_SPREAD).
-MARKERS = {
-    0: ("top left", (-_m, -_m)),
-    1: ("top right", (_W + _m, -_m)),
-    2: ("bottom right", (_W + _m, _H + _m)),
-    3: ("bottom left", (-_m, _H + _m)),
-    4: ("top side", (_W / 2, -_m)),
-    5: ("bottom side", (_W / 2, _H + _m)),
-}
-
-# Printed width of each marker's black square. Bigger far-side markers are fine (and
-# help a lot for low-angle photos): set their size here and print with make_markers.py.
-# Playing area of a 7ft table is ~198cm long, so 1cm ≈ 5 table units.
-TABLE_LENGTH_CM = 198
-MARKER_SIZE_CM = {mid: 5.0 for mid in MARKERS}
-
-# Every marker is taped with its printed arrow pointing straight across the table,
-# toward the felt (perpendicular to the long rails). The warp uses all 4 corners of
-# each marker, so the orientation matters: a marker taped rotated won't line up.
-
-# 2 markers give 8 corner points, enough for the warp, as long as they're spread out:
-# their centers must span at least this fraction of the table in BOTH x and y.
-# (Two markers on the same rail can't tell how the table tilts the other way.)
-MIN_MARKERS = 2
-MIN_SPREAD = 0.5
-# After fitting, if any marker corner lands more than this many table units from its
-# spot, the photo is rejected as "markers misplaced". ~10 units ≈ 0.8in on a 7ft table.
-MAX_MARKER_ERROR = 10
-
-# Felt outline (the default; markers are only a fallback). The felt region's outer edge
+# Felt outline: how the table is found. The felt region's outer edge
 # is where the cushion tops meet the rail, CUSHION_WIDTH table units outside the playing
 # area. On a 9ft table 1 unit = 0.1in, so a 2in cushion top = 20 units. Checked on the
 # test photos: the fitted outline's true aspect ratio (from the lens focal length) came
@@ -65,7 +32,20 @@ FELT_MIN_CHROMA = 8        # the photo's middle must be at least this colorful t
 
 # Detection runs on an upscaled warp for precision; coordinates are scaled back down.
 DETECT_SCALE = 2
-ARUCO_DICT = cv2.aruco.DICT_4X4_50
+# Ball finding (in the photo, see find_balls).
+BALL_WORK_RADIUS = 26      # the photo is resized so the nearest ball is about this many px
+BALL_DIFF_GAIN = 4         # color distance from the felt x this = brightness in the diff image
+BALL_HOUGH_VOTES = 14      # lower = more circles found (and more false ones)
+BALL_MIN_FILL = 0.6        # share of a candidate disc that must differ from the felt
+BALL_MIN_CONTRAST = 60     # disc vs the felt around it, in diff-image units (shadows fail)
+BALL_EIGHT_CHROMA = 0.55   # or a dark disc with at most this share of the felt's color: the 8
+BALL_MIN_HUE_DIFF = 12     # LAB a/b distance from the felt a ball's color must have (not shade)
+# Optional trained ball finder (see yolo_balls). BALL_DETECTOR=yolo in .env turns it on.
+YOLO_MODEL = Path(__file__).resolve().parent / "models" / "balls.onnx"
+YOLO_SIZE = 1024           # model input, px square: must match tools/train_yolo.py
+YOLO_CONF = 0.35           # min score for a box to count as a ball
+YOLO_NMS = 0.45            # boxes overlapping more than this (IoU) are one ball
+TABLE_CROP_MARGIN = 30     # table units of rail/floor kept around the playing area in crops
 # --------------------------------------------------------------------------
 
 
@@ -77,221 +57,19 @@ class VisionError(Exception):
 class VisionResult:
     balls: list[dict]
     warped: np.ndarray            # top-down image at DETECT_SCALE, handy for debugging
-    markers_used: list[int]       # IDs found and trusted
-    markers_rejected: list[int]   # IDs found but ignored as misplaced
-    method: str = "felt"          # what the warp came from: "felt" or "markers"
-
-
-def _detector_params(**overrides) -> cv2.aruco.DetectorParameters:
-    p = cv2.aruco.DetectorParameters()
-    # Sub-pixel corner refinement: locates marker corners between pixels. Matters more the
-    # smaller the markers are, since each pixel of error is a bigger share of the marker.
-    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    # Tuned for small, far-away markers (defaults are built for big, close ones):
-    # - Default rejects any marker whose outline is under 3% of the image's longest side.
-    #   In a 3000px photo that throws away every marker under ~22px wide BEFORE trying to
-    #   read it, which is exactly the far markers. 0.5% keeps them.
-    p.minMarkerPerimeterRate = 0.005
-    p.minCornerDistanceRate = 0.02
-    # Try smaller thresholding windows, so a tiny marker isn't averaged into the felt.
-    p.adaptiveThreshWinSizeMin = 3
-    p.adaptiveThreshWinSizeMax = 53
-    p.adaptiveThreshWinSizeStep = 4
-    # Far markers are seen at a steep angle, so their outline is a squashed, slightly
-    # blurry quadrilateral. Be more forgiving when matching the outline to a 4-sided shape.
-    p.polygonalApproxAccuracyRate = 0.05
-    # Sample each cell of the marker with more pixels when reading its bits.
-    p.perspectiveRemovePixelPerCell = 8
-    p.perspectiveRemoveIgnoredMarginPerCell = 0.2
-    for k, v in overrides.items():
-        setattr(p, k, v)
-    return p
-
-
-_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-_detector = cv2.aruco.ArucoDetector(_dict, _detector_params())
-# Second-chance reader, only ever run on a small crop where a specific marker is
-# expected. Because we already know which ID should be there and where, it can afford
-# to accept more misread bits than a whole-photo search could.
-# errorCorrectionRate multiplies the dictionary's own budget, which is 1 bit for 4x4_50,
-# so the default 0.6 rounds down to 0 corrected bits. 2.0 allows 2 bits out of 16.
-_lenient = cv2.aruco.ArucoDetector(_dict, _detector_params(
-    errorCorrectionRate=2.0,
-    maxErroneousBitsInBorderRate=0.5,      # default 0.35
-))
-# Contrast boost for pass 2: lifts dim or glare-washed markers out of the background.
-_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-
-
-# ---------------------------------------------------------------- 1. markers
-def marker_corners(mid: int) -> np.ndarray:
-    """
-    Where marker `mid`'s 4 corners sit in table coordinates, in ArUco's corner order:
-    top-left, top-right, bottom-right, bottom-left of the PRINTED marker, where "top" is
-    the side its arrow points to. Arrows point across the table toward the felt.
-    """
-    cx, cy = MARKERS[mid][1]
-    half = MARKER_SIZE_CM[mid] * TABLE_W / TABLE_LENGTH_CM / 2
-    up = np.array([0.0, 1.0 if cy < TABLE_H / 2 else -1.0])   # table y grows down
-    right = np.array([-up[1], up[0]])                          # viewed from above
-    center = np.array([cx, cy])
-    return np.float32([center + half * (dx * right - dy * up)
-                       for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
-
-
-# The marker layout as an ArUco "board", so OpenCV can predict where missing markers
-# should be from the ones it found (see find_markers, pass 3).
-_board = cv2.aruco.Board(
-    [np.hstack([marker_corners(i), np.zeros((4, 1), np.float32)]) for i in MARKERS],
-    _dict, np.array(list(MARKERS), np.int32),
-)
-
-
-def detect_raw(img: np.ndarray):
-    """Raw first-pass ArUco output: (corners, ids, rejected candidates). Used by the debug tool."""
-    return _detector.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-
-
-def _known(corners, ids) -> dict[int, np.ndarray]:
-    """Keep detections whose ID is one of ours, as {id: 4x2 corners}."""
-    if ids is None:
-        return {}
-    return {int(m): q.reshape(4, 2) for q, m in zip(corners, ids.flatten()) if int(m) in MARKERS}
-
-
-def find_markers(img: np.ndarray) -> dict[int, np.ndarray]:
-    """
-    Return {marker_id: 4x2 corners in photo pixels} for every known marker found.
-    Cheapest pass first; later passes only run while markers are still missing.
-      1. normal detection on the photo
-      2. same, on a contrast-boosted copy
-      3. board refinement: predict where missing markers should be from the found ones,
-         and re-check the "marker-shaped but unreadable" candidates near those spots
-      4. crop around each still-missing marker's predicted spot, upscale, read leniently
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    corners, ids, rejected = _detector.detectMarkers(gray)
-    found = _known(corners, ids)
-    rejected = list(rejected)
-
-    if len(found) < len(MARKERS):                                  # pass 2
-        c2, i2, r2 = _detector.detectMarkers(_clahe.apply(gray))
-        for mid, q in _known(c2, i2).items():
-            found.setdefault(mid, q)
-        rejected += list(r2)
-
-    if found and len(found) < len(MARKERS):                        # pass 3
-        # How far (px) a candidate may sit from its predicted spot. Tape is never placed
-        # perfectly and the prediction extrapolates, so scale with photo size.
-        refine = cv2.aruco.RefineParameters(
-            minRepDistance=0.01 * max(gray.shape), errorCorrectionRate=3, checkAllOrders=True)
-        det = cv2.aruco.ArucoDetector(_dict, _detector_params(), refine)
-        mids = list(found)
-        c3, i3, _, _ = det.refineDetectedMarkers(
-            gray, _board, [found[m].reshape(1, 4, 2) for m in mids],
-            np.array(mids, np.int32).reshape(-1, 1), rejected)
-        for mid, q in _known(c3, i3).items():
-            found.setdefault(mid, q)
-
-    if _well_spread(found) and len(found) < len(MARKERS):          # pass 4
-        H, _ = _fit(found)
-        if H is not None:
-            to_photo = np.linalg.inv(H)
-            for mid in MARKERS:
-                if mid not in found:
-                    q = _read_crop(gray, mid, to_photo)
-                    if q is not None:
-                        found[mid] = q
-    return found
-
-
-def _read_crop(gray: np.ndarray, mid: int, to_photo: np.ndarray) -> np.ndarray | None:
-    """Look for marker `mid` in an upscaled, contrast-boosted crop around where it should be."""
-    pred = cv2.perspectiveTransform(marker_corners(mid).reshape(-1, 1, 2), to_photo).reshape(4, 2)
-    x0, y0 = pred.min(axis=0)
-    x1, y1 = pred.max(axis=0)
-    w, h = x1 - x0, y1 - y0
-    pad = max(w, h) + 10   # room for placement error and the marker's white border
-    X0, Y0 = int(max(0, x0 - pad)), int(max(0, y0 - pad))
-    X1, Y1 = int(min(gray.shape[1], x1 + pad)), int(min(gray.shape[0], y1 + pad))
-    if X1 - X0 < 8 or Y1 - Y0 < 8:
-        return None   # predicted off-photo
-    # Upscale until the marker's squashed side is ~80px, so each of its 6 cells gets
-    # enough pixels to threshold and read. Capped to keep the crop small.
-    f = float(np.clip(80 / max(min(w, h), 1), 1, 6))
-    crop = cv2.resize(_clahe.apply(gray[Y0:Y1, X0:X1]), None, fx=f, fy=f,
-                      interpolation=cv2.INTER_CUBIC)
-    corners, ids, _ = _lenient.detectMarkers(crop)
-    if ids is None:
-        return None
-    for q, m in zip(corners, ids.flatten()):
-        if int(m) != mid:
-            continue
-        q = q.reshape(4, 2) / f + [X0, Y0]
-        # Lenient reading could misfire: only trust it right where the marker should be.
-        if np.linalg.norm(q.mean(axis=0) - pred.mean(axis=0)) < max(w, h):
-            return q.astype(np.float32)
-    return None
+    detector: str = "circles"     # what found the balls: "circles" or "yolo"
 
 
 # ------------------------------------------------------------------- 2. warp
-def _well_spread(markers: dict) -> bool:
-    """Enough markers, far enough apart in both directions, to pin down the warp."""
-    if len(markers) < MIN_MARKERS:
-        return False
-    centers = np.array([MARKERS[i][1] for i in markers])
-    span = centers.max(axis=0) - centers.min(axis=0)
-    return span[0] >= MIN_SPREAD * TABLE_W and span[1] >= MIN_SPREAD * TABLE_H
-
-
-def _fit(markers: dict[int, np.ndarray]) -> tuple[np.ndarray, float]:
-    """Least-squares homography from every corner of these markers, plus the worst corner's error (table units)."""
-    ids = sorted(markers)
-    src = np.concatenate([markers[i] for i in ids]).astype(np.float32)
-    dst = np.concatenate([marker_corners(i) for i in ids])
-    H, _ = cv2.findHomography(src, dst, 0)  # 0 = plain least squares over all points
-    if H is None:
-        return None, float("inf")
-    projected = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
-    return H, float(np.linalg.norm(projected - dst, axis=1).max())
-
-
-def compute_homography(markers: dict[int, np.ndarray]) -> tuple[np.ndarray, list[int]]:
-    """
-    A homography is a 3x3 matrix that maps points on one flat plane (the table in the
-    photo) onto another (the top-down table). 4 point pairs pin it down exactly.
-
-    Each marker contributes all 4 of its corners, so even 2 markers give 8 pairs. No
-    single matrix fits them all perfectly (tape is never placed perfectly), so we take
-    the least-squares best fit. That averages out small placement errors instead of
-    trusting any one marker completely.
-
-    Sanity check: after fitting, if some corner still lands far from its spot, the setup
-    is wrong (marker bumped, rotated, or taped in the wrong place). We refuse rather than
-    guess, because with only ~6 markers we can't reliably tell WHICH one is wrong.
-    Returns the matrix and a list of marker IDs that were rejected (always empty now;
-    kept so callers don't change if you add smarter rejection later).
-    """
-    H, worst = _fit(markers)
-    if H is None or worst > MAX_MARKER_ERROR:
-        raise VisionError(
-            "The markers don't line up with each other. One may have been moved: check "
-            "they're all flat, in their spots, and with arrows pointing across the table "
-            "toward the felt, then retake."
-        )
-    return H, []
-
-
 def warp_to_table(img: np.ndarray, H: np.ndarray) -> np.ndarray:
     s = DETECT_SCALE
     scale = np.diag([s, s, 1.0])  # table units -> detection pixels
     return cv2.warpPerspective(img, scale @ H, (TABLE_W * s, TABLE_H * s))
 
 
-# --------------------------------------------------------- 2b. felt outline
-# No markers needed: the felt is the biggest, most distinctive thing in the photo, and
-# its far edge stays a long sharp line even when the far markers are unreadable.
-# The cushions are covered in the same cloth, so the felt-colored region ends where the
+# --------------------------------------------------------- 1. the table (felt outline)
+# The felt is the biggest, most distinctive thing in the photo, and its far edge stays a
+# long sharp line even from a low angle. The cushions are covered in the same cloth, so the felt-colored region ends where the
 # cushion tops meet the rail. We fit a straight line to each of those 4 edges and warp
 # their corners to the felt rectangle, which is CUSHION_WIDTH bigger than the playing area
 # on every side. (Cushion tops are about ball-center height, so balls land in the right
@@ -317,7 +95,12 @@ def _felt_mask(small: np.ndarray) -> np.ndarray:
     # Compare color only (LAB a/b), not brightness, so lamp hotspots and shading still count.
     # Very dark pixels have no reliable color (pockets, black rails): keep those out.
     chroma = np.linalg.norm(lab[..., 1:] - felt[1:], axis=2)
-    mask = ((chroma < FELT_CHROMA_TOL) & (lab[..., 0] > 0.35 * felt[0])).astype(np.uint8) * 255
+    # A dull felt sits close to neutral, so an off-white wall can be within FELT_CHROMA_TOL
+    # of it. Felt is colored and the wall isn't (at least half the felt's color), and the
+    # wall is far brighter than any lamp hotspot on the cloth.
+    colorful = np.linalg.norm(lab[..., 1:] - 128, axis=2) > 0.5 * np.linalg.norm(felt[1:] - 128)
+    lit = (lab[..., 0] > 0.35 * felt[0]) & (lab[..., 0] < 1.7 * felt[0])
+    mask = ((chroma < FELT_CHROMA_TOL) & colorful & lit).astype(np.uint8) * 255
     # Bridge the thin dark line where the cushion face meets the bed, and chalk marks.
     k = max(3, int(0.008 * max(h, w)) | 1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
@@ -473,124 +256,408 @@ def felt_homography(fit: FeltFit) -> np.ndarray:
 
 
 # ------------------------------------------------------------------ 3. balls
-def find_circles(warped: np.ndarray) -> np.ndarray:
+# Balls are found in the PHOTO, not the top-down warp. The warp flattens the felt plane,
+# but a ball sticks up out of it: from a low angle the warp smears each ball into a streak
+# several balls long, which gave two detections per ball and colors mixed with the felt.
+# In the photo a ball is still a round disc. We find the discs there and map only each
+# center through the homography (the felt fit maps cushion-top height, about ball-center
+# height, so centers land in the right spot).
+
+def _ball_radius_px(to_photo: np.ndarray, x: float, y: float) -> float:
+    """A ball's radius in photo px at table point (x, y). A sphere looks the same size in
+    every direction, so use the table's least-foreshortened scale there."""
+    p = cv2.perspectiveTransform(np.float32([[[x, y], [x + 1, y], [x, y + 1]]]), to_photo)[0]
+    J = np.array([p[1] - p[0], p[2] - p[0]])
+    return BALL_RADIUS * float(np.linalg.svd(J, compute_uv=False)[0])
+
+
+def find_balls(img: np.ndarray, H: np.ndarray) -> tuple[np.ndarray, list[tuple]]:
     """
-    Plain grayscale fails on dark balls (blue/green/maroon look like felt in gray).
-    Instead build a "how different from the felt is this pixel" image: felt goes black,
-    every ball, whatever its color, goes bright. Then look for circles in that.
+    Ball discs in the photo. Returns (the photo resized for detection;
+    [(table x, table y, x, y, r) ...] with x, y, r in that resized photo's px).
     """
-    r = BALL_RADIUS * DETECT_SCALE
-    lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB).astype(np.float32)
-    felt = np.median(lab.reshape(-1, 3), axis=0)          # felt is most of the image
-    diff = np.linalg.norm(lab - felt, axis=2)
-    diff = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    diff = cv2.GaussianBlur(diff, (5, 5), 1.5)
+    to_photo = np.linalg.inv(H)
+    grid = [(x, y) for x in np.linspace(0, TABLE_W, 5) for y in np.linspace(0, TABLE_H, 3)]
+    radii = [_ball_radius_px(to_photo, x, y) for x, y in grid]
+    s = min(1.0, BALL_WORK_RADIUS / max(radii))
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    to_small = np.diag([s, s, 1.0]) @ to_photo
+    r_min, r_max = min(radii) * s, max(radii) * s
+
+    # Where ball centers can be: the playing area, as seen in the photo.
+    area = cv2.perspectiveTransform(
+        np.float32([[[0, 0], [TABLE_W, 0], [TABLE_W, TABLE_H], [0, TABLE_H]]]), to_small)[0]
+    roi = np.zeros(small.shape[:2], np.uint8)
+    cv2.fillConvexPoly(roi, area.round().astype(np.int32), 255)
+
+    # "How different from the felt" image: felt goes black, any ball, whatever its color,
+    # goes bright. Brightness counts for half, so shading on the cloth doesn't light up
+    # but a dark ball (blue, maroon) on the cloth still does. (The 8 barely shows here;
+    # it's let in by its darkness against the felt around it, below.)
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (3, 3), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+    felt = np.median(lab[roi > 0], axis=0)
+    felt_chroma = float(np.hypot(felt[1] - 128, felt[2] - 128))
+    d = lab - felt
+    dl = 0.5 * d[..., 0]
+    diff = np.sqrt(dl ** 2 + d[..., 1] ** 2 + d[..., 2] ** 2)
+    diff = np.clip(diff * BALL_DIFF_GAIN, 0, 255).astype(np.uint8)
+    diff[cv2.dilate(roi, np.ones((3, 3), np.uint8), iterations=int(r_max) + 2) == 0] = 0
+
     circles = cv2.HoughCircles(
-        diff, cv2.HOUGH_GRADIENT, dp=1.2,
-        minDist=r * 1.6,          # two ball centers can't be closer than ~2 radii
-        param1=100,               # edge strength (Canny high threshold)
-        param2=18,                # lower = more circles found (and more false ones)
-        minRadius=int(r * 0.75), maxRadius=int(r * 1.3),
+        cv2.GaussianBlur(diff, (5, 5), 1.2), cv2.HOUGH_GRADIENT, dp=1,
+        minDist=r_min * 1.2,      # touching balls are ~2 radii apart; dupes are removed below
+        param1=80,                # edge strength (Canny high threshold)
+        param2=BALL_HOUGH_VOTES,  # lower = more circles found (and more false ones)
+        minRadius=int(r_min * 0.7), maxRadius=int(np.ceil(r_max * 1.3)),
     )
-    return np.empty((0, 3)) if circles is None else circles[0]
+    if circles is None:
+        return small, []
+
+    found = []
+    yy, xx = np.mgrid[0:small.shape[0], 0:small.shape[1]]
+    for cx, cy, r in circles[0]:
+        tx, ty = cv2.perspectiveTransform(np.float32([[[cx / s, cy / s]]]), H)[0, 0]
+        # A ball's center is at least a radius from the cushion (some slack for the fit);
+        # circles past that are pocket holes and cushion faces.
+        edge = 0.5 * BALL_RADIUS
+        if not (edge < tx < TABLE_W - edge and edge < ty < TABLE_H - edge):
+            continue
+        want = _ball_radius_px(to_photo, tx, ty) * s
+        # Loose: Hough may fit just a small far ball's bright top, or take in its shadow.
+        # The checks below use the predicted size, so they still judge it fairly.
+        if not 0.6 * want < r < 1.6 * want:
+            continue
+        # Most of a real ball differs from the felt; a fold or chalk mark doesn't. And it
+        # stands out from the felt right around it, which a shadow (by a pocket) doesn't.
+        x0, x1 = int(max(0, cx - 2 * want)), int(cx + 2 * want + 1)
+        y0, y1 = int(max(0, cy - 2 * want)), int(cy + 2 * want + 1)
+        d2 = (xx[y0:y1, x0:x1] - cx) ** 2 + (yy[y0:y1, x0:x1] - cy) ** 2
+        patch = diff[y0:y1, x0:x1].astype(np.float32)
+        inside = patch[d2 < (0.8 * want) ** 2]
+        ring = patch[(d2 > (1.4 * want) ** 2) & (d2 < (1.9 * want) ** 2)]
+        solid = (inside > 90).mean() if inside.size else 0.0
+        # The ring's quieter half: a neighboring ball can fill part of it.
+        around = np.percentile(ring, 40) if ring.size else 0.0
+        stands_out = solid >= BALL_MIN_FILL and np.median(inside) - around >= BALL_MIN_CONTRAST
+        if not stands_out:
+            # The 8: black on dark felt is mostly a brightness difference, which the diff
+            # image halves, and its reflections keep it from looking much darker. What
+            # gives it away is that it has no color, while felt (even in shadow) does.
+            disc = lab[y0:y1, x0:x1][d2 < (0.8 * want) ** 2]
+            Lring = lab[y0:y1, x0:x1, 0][(d2 > (1.4 * want) ** 2) & (d2 < (1.9 * want) ** 2)]
+            chroma = np.median(np.hypot(disc[:, 1] - 128, disc[:, 2] - 128))
+            darker = np.percentile(Lring, 60) - np.median(disc[:, 0]) if Lring.size else 0
+            if chroma > BALL_EIGHT_CHROMA * felt_chroma or darker < 0:
+                continue
+            solid = 0.5   # rank it below the clear finds when removing overlaps
+        # From a low angle the pocket holes poke into the playing area as dark discs the
+        # size of a ball: dark, by a corner or pressed against a rail by a pocket. (An 8-ball
+        # frozen in a corner jaw is lost to this.)
+        near_corner = min(np.hypot(tx - px, ty - py) for px in (0, TABLE_W) for py in (0, TABLE_H))
+        near_rail = min(tx, TABLE_W - tx, ty, TABLE_H - ty)
+        brightness = np.median(lab[y0:y1, x0:x1, 0][d2 < (0.8 * want) ** 2])
+        in_pocket = near_corner < 2.8 * BALL_RADIUS or (near_corner < 5 * BALL_RADIUS
+                                                        and near_rail < 1.5 * BALL_RADIUS)
+        if in_pocket and brightness < 90:
+            continue
+        # Every ball, white and the 8 included, is a different color from the felt. A
+        # cushion face or shadow is the felt's own color, only darker.
+        disc = lab[y0:y1, x0:x1][d2 < (0.8 * want) ** 2]
+        if np.median(np.hypot(disc[:, 1] - felt[1], disc[:, 2] - felt[2])) < BALL_MIN_HUE_DIFF:
+            continue
+        # Hough's own fit hugs the ball's edge better than the predicted size.
+        size = float(np.clip(r, 0.9 * want, 1.3 * want))
+        found.append((solid, float(tx), float(ty), float(cx), float(cy), size))
+
+    # Strongest first; drop anything overlapping a ball we already kept (one ball, two hits).
+    kept = []
+    for solid, tx, ty, cx, cy, r in sorted(found, reverse=True):
+        if all(np.hypot(tx - k[0], ty - k[1]) > 1.8 * BALL_RADIUS for k in kept):   # touching = 2
+            kept.append((tx, ty, cx, cy, r))
+    return small, kept
 
 
-def is_felt(hsv_patch: np.ndarray, felt_hue: float) -> bool:
-    """True if a patch is mostly felt-colored (catches false circles in the cloth)."""
-    h, s = hsv_patch[..., 0].astype(float), hsv_patch[..., 1]
-    close = (np.abs(h - felt_hue) < 10) & (s > 60)
-    return close.mean() > 0.6
+# What each ball looks like, from the LAB color of its colored pixels, measured on real
+# photos: hue angle in degrees, atan2(b - 128, a - 128). Stripes 9-15 match 1-7.
+BALL_HUE = {1: 90, 2: -85, 3: 33, 4: -63, 5: 58, 6: 150, 7: 33}
+BALL_CHROMA = {3: 70, 7: 45}   # red and maroon share a hue: maroon is the duller one
+WHITE_TOL = 16                 # a/b distance from the photo's white to count as white
+CLASSES = [("cue", None)] + [("eight", 8)] + [("solid", n) for n in range(1, 8)] \
+    + [("stripe", n + 8) for n in range(1, 8)]
 
 
-# Approximate OpenCV hues (0-180) -> ball number 1-7. Stripes add 8.
-# Lighting shifts these a lot; it's a best guess, the Correction UI fixes it.
-def guess_number(hue: float, val: float) -> int:
-    if hue < 8 or hue > 170:
-        return 7 if val < 120 else 3     # maroon vs red
-    if hue < 18: return 5                # orange
-    if hue < 35: return 1                # yellow
-    if hue < 90: return 6                # green
-    if hue < 130: return 2               # blue
-    return 4                             # purple
+def _ball_patches(img: np.ndarray, found: list[tuple], scale: float) -> list[tuple]:
+    """For each ball, the full-resolution photo around it as LAB, plus every pixel's
+    distance from the ball's center in radii. Identification reads full resolution:
+    shrunk, a stripe's band seen edge-on blurs into gray."""
+    out = []
+    for _, _, cx, cy, r in found:
+        X, Y, R = cx / scale, cy / scale, r / scale
+        x0, y0 = max(0, int(X - 2 * R)), max(0, int(Y - 2 * R))
+        x1, y1 = min(img.shape[1], int(X + 2 * R) + 1), min(img.shape[0], int(Y + 2 * R) + 1)
+        patch = cv2.GaussianBlur(img[y0:y1, x0:x1], (3, 3), 0)
+        lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        out.append((lab, np.hypot(xx - X, yy - Y) / R))
+    return out
 
 
-def classify(hsv: np.ndarray, x: float, y: float, r: float) -> dict:
+def _white_point(patches: list[tuple]) -> np.ndarray:
+    """The a/b color of 'white' in this photo. Warm light makes the cue ball cream, so a
+    fixed white test misses it. Take the bright near-neutral pixels on the balls."""
+    px = [lab[dist < 0.85] for lab, dist in patches]
+    px = np.concatenate(px) if px else np.empty((0, 3))
+    px = px[(px[:, 0] > 200) & (np.hypot(px[:, 1] - 128, px[:, 2] - 128) < 40)]
+    return np.median(px[:, 1:], axis=0) if len(px) > 50 else np.array([124.0, 140.0])
+
+
+def _felt_around(patches: list[tuple]) -> np.ndarray:
+    """The felt's LAB color, from a ring just outside each ball."""
+    px = [lab[(dist > 1.4) & (dist < 1.9)] for lab, dist in patches]
+    return np.median(np.concatenate(px), axis=0) if px else np.array([100.0, 110.0, 135.0])
+
+
+def _features(lab: np.ndarray, dist: np.ndarray, white_ab: np.ndarray, felt: np.ndarray) -> dict:
+    """How much of the ball is white / dark neutral / colored, and what color."""
+    # Out to the rim: a stripe turned band-away shows its color only at the edges.
+    px = lab[dist < 1.0]
+    d = px - felt
+    px = px[np.sqrt(0.25 * d[:, 0] ** 2 + d[:, 1] ** 2 + d[:, 2] ** 2) > 20]   # felt at the rim
+    if len(px) == 0:
+        return {"white": 0.0, "dark": 0.0, "colored": 0.0, "hue": None, "chroma": 0.0}
+    L, A, B = px.T
+    chroma = np.hypot(A - 128, B - 128)
+    # White by color, not brightness: the shaded half of a white ball is still white.
+    from_white = np.hypot(A - white_ab[0], B - white_ab[1])
+    white = (from_white < WHITE_TOL) & (L > 120)
+    dark = (L < 110) & (chroma < 15)            # the 8's body (reflections keep it off black)
+    # Clearly not white: warm shading on a white ball drifts a little toward yellow.
+    # Down to fairly dark: a purple or maroon band in dim light sits well below mid-gray.
+    colored = (from_white > 1.6 * WHITE_TOL) & ~dark & (chroma > 18) & (L > 30)
+    f = {"white": white.mean(), "dark": dark.mean(), "colored": colored.mean(),
+         "hue": None, "chroma": 0.0}
+    if colored.sum() >= 5:
+        # Circular mean, weighted by how colorful each pixel is.
+        ang = np.arctan2(B[colored] - 128, A[colored] - 128)
+        w = chroma[colored]
+        f["hue"] = float(np.degrees(np.arctan2((w * np.sin(ang)).sum(), (w * np.cos(ang)).sum())))
+        f["chroma"] = float(np.median(chroma[colored]))
+    return f
+
+
+def _cost(f: dict, kind: str, number: int | None) -> float:
+    """How badly a ball with features f fits this class. 0 = perfect."""
+    if kind == "cue":
+        # Mostly by having no real color: warm light leaves part of it in-between cream.
+        return (f["colored"] + f["dark"]) * 3 + (1 - f["white"]) * 0.5
+    if kind == "eight":
+        return (1 - min(1.0, f["dark"] / 0.5)) * 2 + f["white"]
+    base = number - 8 if kind == "stripe" else number
+    if f["hue"] is None:
+        color = 1.5
+    else:
+        diff = abs((f["hue"] - BALL_HUE[base] + 180) % 360 - 180)
+        color = min(diff / 25, 3.0)
+        if base in BALL_CHROMA:
+            color += abs(f["chroma"] - BALL_CHROMA[base]) / 25
+    # A solid shows white only in its number circle and highlights; a stripe shows more,
+    # up to nearly all white when its band is turned away.
+    if kind == "solid":
+        shape = max(0.0, f["white"] - 0.25) * 4
+    else:
+        shape = max(0.0, 0.3 - f["white"]) * 4
+    # A few warm pixels on a white ball aren't a stripe: the hue only counts with some color.
+    scarce = max(0.0, 0.08 - f["colored"]) * 12
+    return color + shape + scarce + f["dark"] * 2
+
+
+def _class_of(ball: str) -> tuple[str, int | None]:
+    """Game ball name ("cue", "1".."15") -> CLASSES entry."""
+    if ball == "cue":
+        return ("cue", None)
+    n = int(ball)
+    return ("eight", 8) if n == 8 else ("solid", n) if n < 8 else ("stripe", n)
+
+
+def _improve_by_swaps(out: list[dict | None], costs: np.ndarray, classes: list[tuple]) -> None:
+    """Greedy naming can lose overall: the red 11 grabs "15" because it fits that a bit
+    better than the real 15 does, leaving the 15 a bad "11". Swap names between pairs of
+    balls (or to an unused name) while that lowers the total cost."""
+    index = {c: k for k, c in enumerate(classes)}
+    assigned = [index[(o["type"], o["id"])] if o else None for o in out]
+    for _ in range(10):
+        better = False
+        for i in range(len(out)):
+            if assigned[i] is None:
+                continue
+            for j in range(len(out)):                    # swap with another ball
+                a, b = assigned[i], assigned[j]
+                if j <= i or b is None:
+                    continue
+                if costs[i, b] + costs[j, a] < costs[i, a] + costs[j, b] - 1e-9:
+                    assigned[i], assigned[j], better = b, a, True
+            used = set(assigned)
+            for c in range(len(classes)):                # move to a name nobody has
+                if c not in used and costs[i, c] < costs[i, assigned[i]] - 1e-9:
+                    used.discard(assigned[i]); used.add(c)
+                    assigned[i], better = c, True
+        if not better:
+            break
+    for i, c in enumerate(assigned):
+        if c is not None and (out[i]["type"], out[i]["id"]) != classes[c]:
+            kind, number = classes[c]
+            # A swapped name was nobody's first choice: as sure as its margin over the next.
+            margin = float(np.delete(costs[i], c).min() - costs[i, c])
+            out[i] = {"type": kind, "id": number,
+                      "confidence": round(max(0.3, min(1.0, 0.5 + margin / 2)), 2)}
+
+
+def classify_all(img: np.ndarray, found: list[tuple], scale: float,
+                 allowed: set[str] | None = None) -> list[dict]:
     """
-    Look only at pixels inside the ball. Count how many are white (cue / stripe band),
-    black (8-ball), or colored. The ratios decide the type.
+    Name every ball at once. Each photo has one cue ball and one of each number, so
+    instead of naming balls one by one (two "2"s, no 10) we score every ball against all
+    16 and hand out the best fits first. `found` is from find_balls, whose px are the
+    photo resized by `scale`; `img` is the full photo. `allowed`: the balls still in play
+    ("cue", "1".."15"); a pocketed ball is never a candidate name.
     """
-    mask = np.zeros(hsv.shape[:2], np.uint8)
-    cv2.circle(mask, (int(x), int(y)), int(r * 0.85), 255, -1)
-    px = hsv[mask > 0]
-    h, s, v = px[:, 0].astype(float), px[:, 1], px[:, 2]
+    if not found:
+        return []
+    classes = CLASSES if allowed is None else [c for c in CLASSES if c in {_class_of(b) for b in allowed}]
+    if not classes:
+        return [{"type": "solid", "id": None, "confidence": 0.3} for _ in found]
+    patches = _ball_patches(img, found, scale)
+    white_ab, felt = _white_point(patches), _felt_around(patches)
+    feats = [_features(lab, dist, white_ab, felt) for lab, dist in patches]
+    costs = np.array([[_cost(f, k, n) for k, n in classes] for f in feats])
 
-    white = ((s < 60) & (v > 170)).mean()
-    black = (v < 60).mean()
-    colored = ~((s < 60) & (v > 170)) & (v >= 60)
+    out: list[dict | None] = [None] * len(feats)
+    taken = set()
+    for flat in np.argsort(costs, axis=None):
+        i, c = divmod(int(flat), len(classes))
+        if out[i] is not None or c in taken:
+            continue
+        others = np.delete(costs[i], c)
+        # Sure when this fit is good AND clearly better than the ball's next best guess.
+        margin = float(others.min() - costs[i, c]) if len(others) else 1.0
+        conf = max(0.3, min(1.0, 0.5 + margin / 2 - max(0.0, costs[i, c] - 0.5) / 2))
+        kind, number = classes[c]
+        out[i] = {"type": kind, "id": number, "confidence": round(conf, 2)}
+        taken.add(c)
+    _improve_by_swaps(out, costs, classes)
+    for i, o in enumerate(out):   # more balls than numbers: best guess, flagged for correction
+        if o is None:
+            kind, number = classes[int(costs[i].argmin())]
+            out[i] = {"type": kind, "id": number, "confidence": 0.3}
+    return out
 
-    if white > 0.75:
-        return {"type": "cue", "id": None, "confidence": round(float(min(1.0, white)), 2)}
-    if black > 0.55:
-        return {"type": "eight", "id": 8, "confidence": round(float(min(1.0, black)), 2)}
 
-    hue = float(np.median(h[colored])) if colored.any() else 0.0
-    val = float(np.median(v[colored])) if colored.any() else 0.0
-    n = guess_number(hue, val)
-    # Stripe: a solid color band on a white ball, so lots of white but not mostly white.
-    # Thresholds are a starting point: tune them with tools/debug_vision.py on real photos.
-    if white > 0.2:
-        conf = 1 - abs(white - 0.45) * 2.5    # most sure around 45% white
-        return {"type": "stripe", "id": n + 8, "confidence": round(float(max(0.3, conf)), 2)}
-    conf = 1 - white / 0.2                    # most sure at 0% white
-    return {"type": "solid", "id": n, "confidence": round(float(max(0.3, conf)), 2)}
+# ------------------------------------------------------------- 3b. balls, trained model
+# Optional: a YOLOv8n detector trained on our own photos (tools/export_yolo.py, then
+# tools/train_yolo.py) finds the balls instead of the circle search; it copes better with
+# touching balls, like a rack. It only finds them: naming is classify_all either way.
+# On when BALL_DETECTOR=yolo and the model loads; otherwise, or on any error, find_balls.
+
+def table_crop(img: np.ndarray, H: np.ndarray) -> tuple[int, int, int, int]:
+    """Photo px box (x0, y0, x1, y1) around the playing area plus a margin. Training
+    crops and live detection use the same box, so the model sees what it learned on."""
+    m = TABLE_CROP_MARGIN
+    corners = np.float32([[[-m, -m], [TABLE_W + m, -m], [TABLE_W + m, TABLE_H + m], [-m, TABLE_H + m]]])
+    p = cv2.perspectiveTransform(corners, np.linalg.inv(H))[0]
+    x0, y0 = np.floor(p.min(axis=0)).astype(int)
+    x1, y1 = np.ceil(p.max(axis=0)).astype(int)
+    h, w = img.shape[:2]
+    return max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+
+
+_yolo_net = None
+_yolo_tried = False
+
+
+def _yolo_model():
+    """The ONNX net, loaded once. None if it's off, missing or broken."""
+    global _yolo_net, _yolo_tried
+    if os.getenv("BALL_DETECTOR", "circles") != "yolo":
+        return None
+    if not _yolo_tried:
+        _yolo_tried = True
+        path = Path(os.getenv("YOLO_MODEL", YOLO_MODEL))
+        try:
+            _yolo_net = cv2.dnn.readNetFromONNX(str(path))
+        except cv2.error as e:
+            log.warning("BALL_DETECTOR=yolo but %s didn't load, using circles: %s", path, e)
+    return _yolo_net
+
+
+def _letterbox(img: np.ndarray, size: int) -> tuple[np.ndarray, float, int, int]:
+    """Resize to fit a size x size square, padded gray like YOLO's training. Returns
+    (square image, scale, left pad, top pad)."""
+    h, w = img.shape[:2]
+    k = size / max(h, w)
+    nw, nh = round(w * k), round(h * k)
+    out = np.full((size, size, 3), 114, np.uint8)
+    left, top = (size - nw) // 2, (size - nh) // 2
+    out[top:top + nh, left:left + nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    return out, k, left, top
+
+
+def decode_yolo(out: np.ndarray, conf: float = YOLO_CONF, nms: float = YOLO_NMS) -> list[tuple]:
+    """YOLOv8 output (1, 4 + classes, N) -> [(cx, cy, w, h, score)] in input px, after NMS."""
+    pred = out[0].T                                   # (N, 4 + classes)
+    scores = pred[:, 4:].max(axis=1)
+    pred, scores = pred[scores >= conf], scores[scores >= conf]
+    if len(pred) == 0:
+        return []
+    boxes = [[float(cx - w / 2), float(cy - h / 2), float(w), float(h)] for cx, cy, w, h in pred[:, :4]]
+    keep = cv2.dnn.NMSBoxes(boxes, scores.astype(float).tolist(), conf, nms)
+    return [(*pred[i, :4].astype(float), float(scores[i])) for i in np.array(keep).reshape(-1)]
+
+
+def yolo_balls(img: np.ndarray, H: np.ndarray) -> list[tuple] | None:
+    """
+    Balls from the trained model, in find_balls' format but full-resolution px:
+    [(table x, table y, x, y, r)]. None when the model is off or fails, so the caller
+    falls back to find_balls.
+    """
+    net = _yolo_model()
+    if net is None:
+        return None
+    try:
+        x0, y0, x1, y1 = table_crop(img, H)
+        square, k, left, top = _letterbox(img[y0:y1, x0:x1], YOLO_SIZE)
+        net.setInput(cv2.dnn.blobFromImage(square, 1 / 255.0, swapRB=True))
+        boxes = decode_yolo(net.forward())
+    except cv2.error as e:
+        log.warning("YOLO ball detection failed, using circles: %s", e)
+        return None
+    found = []
+    for bx, by, bw, bh, _ in sorted(boxes, key=lambda b: -b[4]):
+        cx, cy = (bx - left) / k + x0, (by - top) / k + y0
+        tx, ty = cv2.perspectiveTransform(np.float32([[[cx, cy]]]), H)[0, 0]
+        edge = 0.5 * BALL_RADIUS                      # same limits as find_balls
+        if not (edge < tx < TABLE_W - edge and edge < ty < TABLE_H - edge):
+            continue
+        if any(np.hypot(tx - f[0], ty - f[1]) < 1.8 * BALL_RADIUS for f in found):
+            continue
+        found.append((float(tx), float(ty), cx, cy, (bw + bh) / 4 / k))
+    return found
 
 
 # ------------------------------------------------------------------ pipeline
-def table_homography(img: np.ndarray) -> tuple[np.ndarray, str, list[int], list[int]]:
-    """
-    Photo -> table homography. Felt outline first; markers only if that fails, so a table
-    with markers still works when something hides the felt edges. If both fail, the felt
-    error is shown: it's the one the user can most likely fix.
-    Returns (H, method, markers used, markers rejected).
-    """
-    try:
-        return felt_homography(find_felt(img)), "felt", [], []
-    except VisionError as felt_error:
-        markers = find_markers(img)
-        if not _well_spread(markers):
-            raise felt_error
-        try:
-            H, rejected = compute_homography(markers)
-        except VisionError:
-            raise felt_error
-        return H, "markers", [i for i in sorted(markers) if i not in rejected], rejected
+def table_homography(img: np.ndarray) -> np.ndarray:
+    """Photo -> table homography, from the felt's outline."""
+    return felt_homography(find_felt(img))
 
 
-def analyze_image(img: np.ndarray) -> VisionResult:
-    H, method, used, rejected = table_homography(img)
+def analyze_image(img: np.ndarray, allowed: set[str] | None = None) -> VisionResult:
+    """allowed: limit the names to these balls ("cue", "1".."15"). None = all 16, which is
+    what games use: the game's memory, not vision, decides what's still in play."""
+    H = table_homography(img)
     warped = warp_to_table(img, H)
-    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-    felt_hue = float(np.median(hsv[..., 0]))   # the felt is most of the image
-
-    r = BALL_RADIUS * DETECT_SCALE
-    balls = []
-    for x, y, rad in find_circles(warped):
-        y0, y1, x0, x1 = int(y - r / 2), int(y + r / 2), int(x - r / 2), int(x + r / 2)
-        patch = hsv[max(0, y0):y1, max(0, x0):x1]
-        if patch.size == 0 or is_felt(patch, felt_hue):
-            continue
-        info = classify(hsv, x, y, rad)
-        balls.append({
-            **info,
-            "x": round(float(x) / DETECT_SCALE, 1),
-            "y": round(float(y) / DETECT_SCALE, 1),
-        })
-
-    # Only one cue ball and one 8-ball can exist: keep the most confident of each.
-    for t in ("cue", "eight"):
-        same = sorted([b for b in balls if b["type"] == t], key=lambda b: -b["confidence"])
-        for extra in same[1:]:
-            extra["type"], extra["confidence"] = "solid", 0.3  # flag for user correction
-
-    return VisionResult(balls=balls, warped=warped, markers_used=used,
-                        markers_rejected=rejected, method=method)
+    found, scale, detector = yolo_balls(img, H), 1.0, "yolo"
+    if found is None:
+        small, found = find_balls(img, H)
+        scale, detector = small.shape[1] / img.shape[1], "circles"
+    names = classify_all(img, found, scale, allowed)
+    balls = [{**info, "x": round(tx, 1), "y": round(ty, 1)} for info, (tx, ty, *_) in zip(names, found)]
+    return VisionResult(balls=balls, warped=warped, detector=detector)

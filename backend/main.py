@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator  # noqa:
 import ball_id  # noqa: E402
 import coach  # noqa: E402
 import game  # noqa: E402
+import physics  # noqa: E402
 import store  # noqa: E402
 import voice  # noqa: E402
 from vision import BALL_RADIUS, TABLE_H, TABLE_W, VisionError, analyze_image  # noqa: E402
@@ -45,10 +46,11 @@ async def _read_photo(photo: UploadFile) -> np.ndarray:
     return img
 
 
-def _vision(img: np.ndarray) -> tuple[list[dict], list[dict]]:
-    """CV finds the balls, Gemini double-checks what each one is. Returns (balls, not-balls)."""
+def _vision(img: np.ndarray, allowed: set[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """CV finds the balls, Gemini double-checks what each one is. Returns (balls, not-balls).
+    allowed: the balls still in play, so vision never names a pocketed one."""
     try:
-        result = analyze_image(img)
+        result = analyze_image(img, allowed)
     except VisionError as e:
         # 422 = "I understood the request but can't use this photo". Frontend shows the message.
         raise HTTPException(422, str(e))
@@ -134,6 +136,38 @@ class AdviceRequest(BaseModel):
     candidates: list[Candidate] = Field(max_length=12)
 
 
+class Spin(BaseModel):
+    x: float = Field(0.0, ge=-1, le=1)   # -1 left english .. 1 right english
+    y: float = Field(0.0, ge=-1, le=1)   # -1 full draw .. 1 full follow
+
+
+class SimulateRequest(BaseModel):
+    """A shot from the shot finder, struck with this power and spin."""
+    target_id: int = Field(ge=1, le=15)
+    pocket: str
+    kind: str = "direct"
+    cut_angle: float | None = None       # picks between banks off different cushions
+    power: float = Field(ge=0, le=1)
+    spin: Spin = Spin()
+
+
+class PlanBall(BaseModel):
+    id: int | None = Field(default=None, ge=1, le=15)   # null = the cue ball
+    type: str                                            # "cue" | "eight" | "solid" | "stripe"
+    x: float = Field(ge=0, le=TABLE_W)
+    y: float = Field(ge=0, le=TABLE_H)
+
+
+class PlanRequest(BaseModel):
+    """A layout and a shot from the shot finder. No game needed."""
+    balls: list[PlanBall] = Field(max_length=16)
+    group: str | None = None             # the shooter's group; null = open table
+    target_id: int = Field(ge=1, le=15)
+    pocket: str
+    kind: str = "direct"
+    cut_angle: float | None = None
+
+
 @app.post("/games")
 def create_game(body: NewGame):
     state = game.new_game(body.players)
@@ -157,6 +191,7 @@ def _photo_result(state: dict, result: dict, not_balls: list[dict] = ()) -> dict
         "balls": result["balls"],
         "missing": result["missing"],
         "rejected": result["rejected"] + list(not_balls),
+        "revived": result.get("revived", []),
         "shot": result["shot"],
         "game": game.public(state),
     }
@@ -183,6 +218,9 @@ async def analyze_in_game(
         meant = Intended.model_validate_json(intended).model_dump() if intended else None
     except ValidationError as e:
         raise HTTPException(422, f"`intended` isn't a valid shot: {e.errors()[0]['msg']}")
+    # Vision names balls freely (all 16); the game's memory decides. Restricting names to
+    # balls in play hid a ball that one bad photo had wrongly marked pocketed: this way
+    # it's seen again and brought back (game.revive).
     balls, not_balls = _vision(await _read_photo(photo))
     try:
         if retake:
@@ -222,6 +260,72 @@ def advice(game_id: str, body: AdviceRequest):
         raise HTTPException(502, str(e))
     _save(state)   # keeps the suggestion, so the next photo's shot knows it was coached
     return result
+
+
+@app.post("/games/{game_id}/simulate")
+def simulate(game_id: str, body: SimulateRequest):
+    """
+    What happens if the current player hits this shot with this power and spin: does the
+    ball drop, where does the cue ball go and stop, does it scratch. For previewing the
+    spin indicator and power bar live. Uses the game's latest layout.
+    """
+    state = _load(game_id)
+    group = state["players"][state["turn"]]["group"]
+    balls = physics.balls_from_state(state)
+    if state.get("ball_in_hand"):
+        raise HTTPException(409, "Ball in hand: place the cue ball (see /plan/ball-in-hand) "
+                                 "and take a photo, then simulate from there.")
+    if not any(b["type"] == "cue" for b in balls):
+        raise HTTPException(409, "The cue ball hasn't been seen yet. Take a photo of the table first.")
+    shot = physics.match_shot(balls, group, body.target_id, body.pocket, body.kind, body.cut_angle)
+    if shot is None:
+        raise HTTPException(409, "That shot isn't open from this layout.")
+    result = physics.simulate(balls, shot, body.power, (body.spin.x, body.spin.y))
+    return {
+        **physics.result_json(result),
+        "speed": physics.speed_word(body.power),
+        "spin_name": physics.spin_word((body.spin.x, body.spin.y)),
+    }
+
+
+@app.post("/plan")
+def plan_shot(body: PlanRequest):
+    """
+    Physics only: the best power and spin for this shot from this layout (pockets it, no
+    scratch, easiest next shot). No game, database or Gemini, so it works for any layout
+    the frontend has, including its test table. `physics` is null if nothing tried pockets it.
+    """
+    balls = [b.model_dump() for b in body.balls]
+    if not any(b["type"] == "cue" for b in balls):
+        raise HTTPException(409, "There's no cue ball in this layout.")
+    shot = physics.match_shot(balls, body.group, body.target_id, body.pocket, body.kind, body.cut_angle)
+    if shot is None:
+        raise HTTPException(409, "That shot isn't open from this layout.")
+    p = physics.plan(balls, shot, body.group)
+    if p is None:
+        return {"physics": None, "speed": None, "spin_name": None}
+    return {"physics": physics.plan_json(p), "speed": physics.speed_word(p.power),
+            "spin_name": physics.spin_word(p.spin)}
+
+
+class HandRequest(BaseModel):
+    """A layout after a scratch: where should the cue ball go? Its old spot is ignored."""
+    balls: list[PlanBall] = Field(max_length=16)
+    group: str | None = None             # the shooter's group; null = open table
+
+
+@app.post("/plan/ball-in-hand")
+def plan_ball_in_hand(body: HandRequest):
+    """
+    Ball in hand (after the opponent scratched): the best spot for the cue ball, the shot
+    from there, and its power, spin and cue ball path. Physics only, like /plan. Every
+    field is null if no spot gives a makeable shot (play safe).
+    """
+    h = physics.ball_in_hand([b.model_dump() for b in body.balls], body.group)
+    if h is None:
+        return {"cue": None, "target_ball": None, "pocket": None, "kind": None, "cut_angle": None,
+                "physics": None, "speed": None, "spin_name": None}
+    return physics.hand_json(h)
 
 
 @app.get("/games/{game_id}/advice/audio")

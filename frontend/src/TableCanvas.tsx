@@ -19,13 +19,16 @@ function polyline(ctx: CanvasRenderingContext2D, pts: Vec[]) {
   ctx.stroke()
 }
 
+/** A pointer position in table units, plus the CSS pixels per table unit. */
+function toTable(data: AnalyzeResponse, canvas: HTMLCanvasElement, clientX: number, clientY: number) {
+  const rect = canvas.getBoundingClientRect()
+  const s = rect.width / (data.table.width + 2 * RAIL)
+  return { tx: (clientX - rect.left) / s - RAIL, ty: (clientY - rect.top) / s - RAIL, s }
+}
+
 /** Nearest ball to a pointer, in table units. 2 radii, then 3 if that misses. */
 function ballIndexAt(data: AnalyzeResponse, canvas: HTMLCanvasElement, clientX: number, clientY: number): number | null {
-  const rect = canvas.getBoundingClientRect()
-  const TW = data.table.width
-  const s = rect.width / (TW + 2 * RAIL)
-  const tx = (clientX - rect.left) / s - RAIL
-  const ty = (clientY - rect.top) / s - RAIL
+  const { tx, ty } = toTable(data, canvas, clientX, clientY)
   const r = data.ball_radius
 
   let nearest = -1
@@ -44,11 +47,40 @@ function ballIndexAt(data: AnalyzeResponse, canvas: HTMLCanvasElement, clientX: 
   return null
 }
 
+function distToSegment(px: number, py: number, a: Vec, b: Vec): number {
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const len2 = dx * dx + dy * dy
+  const t = len2 ? Math.max(0, Math.min(1, ((px - a.x) * dx + (py - a.y) * dy) / len2)) : 0
+  return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy))
+}
+
+const SHOT_HIT_PX = 22 // how close a finger has to land to a shot's line
+
+/** The shot whose drawn lines (cue path or target path) are nearest the pointer, if close. */
+function shotIndexAt(data: AnalyzeResponse, shots: Shot[], canvas: HTMLCanvasElement, clientX: number, clientY: number): number | null {
+  const { tx, ty, s } = toTable(data, canvas, clientX, clientY)
+  let nearest: number | null = null
+  let nearestDist = SHOT_HIT_PX / s
+  shots.forEach((shot, i) => {
+    for (const path of [shot.cuePath, shot.targetPath]) {
+      for (let k = 1; k < path.length; k++) {
+        const dist = distToSegment(tx, ty, path[k - 1], path[k])
+        if (dist < nearestDist) {
+          nearest = i
+          nearestDist = dist
+        }
+      }
+    }
+  })
+  return nearest
+}
+
 type Press = {
   pointerId: number
   x: number
   y: number
-  index: number
+  target: { kind: 'ball' | 'shot'; index: number }
   moved: boolean
 }
 
@@ -85,6 +117,7 @@ export function TableCanvas({
   showConfidence = true,
   highlight = null,
   onBallTap,
+  onShotTap,
 }: {
   data: AnalyzeResponse
   shots?: Shot[]
@@ -93,23 +126,27 @@ export function TableCanvas({
   /** Index of a ball to ring, e.g. the one the ball picker is open for. */
   highlight?: number | null
   onBallTap?: (index: number) => void
+  /** Tapping a shot's line: index into `shots`. Used when balls aren't editable. */
+  onShotTap?: (index: number) => void
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
   const press = useRef<Press | null>(null)
 
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (e.button !== 0 || !onBallTap) return
+    if (e.button !== 0) return
     const canvas = ref.current
     if (!canvas) return
-    const index = ballIndexAt(data, canvas, e.clientX, e.clientY)
-    if (index == null) return
+    const ball = onBallTap ? ballIndexAt(data, canvas, e.clientX, e.clientY) : null
+    const shot = ball == null && onShotTap ? shotIndexAt(data, shots, canvas, e.clientX, e.clientY) : null
+    const target = ball != null ? { kind: 'ball' as const, index: ball } : shot != null ? { kind: 'shot' as const, index: shot } : null
+    if (!target) return
     e.preventDefault()
     try {
       canvas.setPointerCapture(e.pointerId)
     } catch {
       // Synthetic events have no pointer to capture.
     }
-    press.current = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, index, moved: false }
+    press.current = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, target, moved: false }
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -122,7 +159,9 @@ export function TableCanvas({
     const current = press.current
     if (!current || current.pointerId !== e.pointerId) return
     press.current = null
-    if (tap && !current.moved) onBallTap?.(current.index)
+    if (!tap || current.moved) return
+    if (current.target.kind === 'ball') onBallTap?.(current.target.index)
+    else onShotTap?.(current.target.index)
   }
 
   useEffect(() => {

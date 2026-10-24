@@ -80,6 +80,20 @@ export interface Candidate {
   target_distance: number
 }
 
+/** Spin and power numbers (CONTRACT.md "Spin and power"). */
+export interface ShotPhysics {
+  planned: boolean // true: backend picked power/spin for position; false: a plain simulation
+  power: number // 0 (barely moving) .. 1 (hard break)
+  spin: { x: number; y: number } // each -1..1; x: left/right english, y: draw (-) / follow (+)
+  cue_path: { x: number; y: number }[] // cue ball start -> contact -> where it stops
+  cue_stop: { x: number; y: number }
+  object_path: { x: number; y: number }[]
+  scratch: boolean
+  next_shot?: { target_ball: number; pocket: string; cut_angle: number } | null // advice only
+  made?: boolean // simulate only
+  kissed?: boolean // simulate only
+}
+
 export interface Advice {
   shot_index: number // -1 = no good shot: play the safety described in `aim`
   target_ball: number | null
@@ -90,6 +104,7 @@ export interface Advice {
   cue_ball_after: string
   why: string
   tip: string
+  physics: ShotPhysics | null // null for a safety, or if the cue ball's position is unknown
 }
 
 interface Rate {
