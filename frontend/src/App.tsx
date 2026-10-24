@@ -227,6 +227,44 @@ function PhotoButton({ label, onFile, disabled, primary }: {
   )
 }
 
+/** Full screen's photo button: the next photo without leaving the table view. */
+function CameraButton({ label, onFile, disabled, busy }: {
+  label: string
+  onFile: (file: File) => void
+  disabled: boolean
+  busy: boolean
+}) {
+  return (
+    <label
+      aria-label={busy ? 'Reading the table…' : label}
+      className={`flex h-14 w-20 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-emerald-700 text-white shadow-md focus-within:ring-4 focus-within:ring-emerald-400 active:bg-emerald-800 ${
+        disabled ? 'opacity-60' : ''
+      }`}
+    >
+      {busy ? (
+        <span className="size-6 animate-spin rounded-full border-[3px] border-white border-t-transparent" aria-hidden="true" />
+      ) : (
+        <svg viewBox="0 0 24 24" className="size-7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" />
+          <circle cx="12" cy="13" r="3.5" />
+        </svg>
+      )}
+      <input
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        disabled={disabled}
+        onChange={e => {
+          const file = e.target.files?.[0]
+          e.target.value = ''
+          if (file) onFile(file)
+        }}
+      />
+    </label>
+  )
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [game, setGame] = useState<Game | null>(null)
@@ -646,8 +684,23 @@ export default function App() {
                       </p>
                     </div>
                   )}
-                  {!confirmed && (
-                    <div className="stage-tools">
+                  {/* The page's error message is hidden behind full screen: repeat it here */}
+                  {status.kind === 'error' && placing == null && (
+                    <div className="stage-only absolute inset-x-0 top-2 z-10 flex justify-center px-2">
+                      <p role="alert" className="flex max-w-md items-center gap-3 rounded-2xl bg-red-900/95 py-1.5 pr-1.5 pl-4 text-sm font-medium text-white shadow-lg">
+                        {status.message}
+                        <button
+                          type="button"
+                          onClick={() => setStatus({ kind: 'idle' })}
+                          className="shrink-0 rounded-full bg-white/15 px-3 py-1.5 font-semibold active:bg-white/25"
+                        >
+                          OK
+                        </button>
+                      </p>
+                    </div>
+                  )}
+                  <div className="stage-tools">
+                    {!confirmed && (
                       <EditToolbar
                         vertical
                         tool={tool}
@@ -658,8 +711,14 @@ export default function App() {
                         onRedo={redo}
                         onConfirm={confirmLayout}
                       />
-                    </div>
-                  )}
+                    )}
+                    <CameraButton
+                      busy={busy && status.what === 'Reading the table…'}
+                      disabled={busy}
+                      label={photoCount === 0 ? 'Photo of the table' : `Photo after ${shooterName}’s shot`}
+                      onFile={f => handlePhoto(f, false)}
+                    />
+                  </div>
                 </div>
 
                 {gutterPanel()}
