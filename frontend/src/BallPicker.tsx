@@ -29,7 +29,13 @@ function BallIcon({ n }: { n: number }) {
   )
 }
 
-export function BallPicker({ ball, onPick, onClose }: { ball: Ball; onPick: (n: number) => void; onClose: () => void }) {
+export function BallPicker({ ball, unavailable, onPick, onClose }: {
+  ball: Ball
+  /** Balls already pocketed this game: can't be on the table. */
+  unavailable: Set<number>
+  onPick: (n: number) => void
+  onClose: () => void
+}) {
   const current = ball.type === 'cue' ? 0 : ball.id
 
   return (
@@ -62,10 +68,11 @@ export function BallPicker({ ball, onPick, onClose }: { ball: Ball; onPick: (n: 
             <button
               key={n}
               type="button"
-              aria-label={n === 0 ? 'Cue ball' : `Ball ${n}`}
+              aria-label={n === 0 ? 'Cue ball' : `Ball ${n}${unavailable.has(n) ? ', pocketed' : ''}`}
               aria-pressed={n === current}
+              disabled={unavailable.has(n)}
               onClick={() => onPick(n)}
-              className={`flex h-14 items-center justify-center rounded-xl active:bg-stone-200 dark:active:bg-stone-800 ${
+              className={`flex h-14 items-center justify-center rounded-xl active:bg-stone-200 disabled:opacity-25 dark:active:bg-stone-800 ${
                 n === current ? 'bg-emerald-100 ring-2 ring-emerald-500 dark:bg-emerald-950' : ''
               }`}
             >
