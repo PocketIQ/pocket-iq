@@ -1,4 +1,13 @@
-import type { AnalyzeResponse, Advice, Candidate, Game, GameAnalyzeResponse, IntendedShot, PlayerStats } from './types'
+import type {
+  AnalyzeResponse,
+  Advice,
+  Candidate,
+  Game,
+  GameAnalyzeResponse,
+  IntendedShot,
+  LayoutBall,
+  PlayerStats,
+} from './types'
 
 export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
@@ -19,9 +28,10 @@ const json = (body: unknown): RequestInit => ({
   body: JSON.stringify(body),
 })
 
-function photoForm(photo: Blob): RequestInit {
+function photoForm(photo: Blob, fields: Record<string, string> = {}): RequestInit {
   const form = new FormData()
   form.append('photo', photo, 'table.jpg') // field name must match FastAPI's `photo` param
+  for (const [k, v] of Object.entries(fields)) form.append(k, v)
   return { method: 'POST', body: form }
 }
 
@@ -31,11 +41,29 @@ export const createGame = (players: [string, string]) => request<Game>('/games',
 
 export const getGame = (id: string) => request<Game>(`/games/${id}`)
 
-export const analyzeGamePhoto = (id: string, photo: Blob) =>
-  request<GameAnalyzeResponse>(`/games/${id}/analyze`, photoForm(photo))
+/**
+ * The next photo of the table. The backend compares it with the previous one to work out
+ * the shot in between (what went in, scratch) and applies it. `intended`: the shot the
+ * player went for. `retake`: replace the latest photo instead of following it.
+ */
+export function analyzeGamePhoto(
+  id: string,
+  photo: Blob,
+  { intended = null, retake = false }: { intended?: IntendedShot | null; retake?: boolean } = {},
+) {
+  const fields: Record<string, string> = { retake: String(retake) }
+  if (intended) fields.intended = JSON.stringify(intended)
+  return request<GameAnalyzeResponse>(`/games/${id}/analyze`, photoForm(photo, fields))
+}
 
-export const recordShot = (id: string, pocketed: number[], scratch: boolean, intended: IntendedShot | null) =>
-  request<Game>(`/games/${id}/shot`, json({ pocketed, scratch, intended }))
+/**
+ * The player fixed the latest photo's layout. The backend replays that photo with these
+ * balls, recomputing the shot it showed (what went in, whose turn). For the editor.
+ */
+export const correctLayout = (id: string, balls: LayoutBall[], intended: IntendedShot | null = null) => {
+  const init = json({ balls, intended })
+  return request<GameAnalyzeResponse>(`/games/${id}/layout`, { ...init, method: 'PUT' })
+}
 
 export const getAdvice = (id: string, candidates: Candidate[]) =>
   request<Advice>(`/games/${id}/advice`, json({ candidates }))

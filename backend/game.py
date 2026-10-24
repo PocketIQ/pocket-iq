@@ -8,10 +8,17 @@ The table state here is AUTHORITATIVE. Vision only proposes; this decides:
   so a detection that looks like one gets matched to a ball still in play, or rejected.
 - Detections left over after matching are rejected as false detections (glare, chalk,
   a hand...). There can't be more balls than the table has left.
-- A ball seen in an earlier photo but not in this one is NOT removed (it may be hidden
-  behind another ball). It's reported as "missing" and the player confirms if it went in.
-  Balls never seen yet aren't "missing": they were never found in the first place.
+
+Shots are worked out from consecutive photos (process_photo): take a photo, shoot, take
+the next photo. A ball seen in the last photo and gone from this one went in; the cue
+ball gone means a scratch. If nothing went in and nothing moved, no shot was taken (a
+retake). Balls not seen in EITHER photo stay in play: probably hidden, not pocketed.
+
+Every photo can be corrected (the frontend's layout editor): the game rewinds to just
+before that photo and replays it with the fixed layout (replace_photo), so a mistaken
+"pocketed" never sticks.
 """
+import copy
 import math
 import time
 import uuid
@@ -25,6 +32,9 @@ MATCH_MAX_COST = 1.6
 MOVE_SCALE = 300          # table units; a ball this far from its last spot costs +0.5
 FLAG_COST = 0.6           # matches costlier than this get flagged for the user to confirm
 UNSEEN_COST = 0.25        # position cost for a ball we have never seen yet
+# Between two photos, if no ball moved more than this (table units), no shot was taken.
+# Covers the jitter of shooting the same layout from a different spot.
+MOVE_EPS = 20
 
 
 class GameError(Exception):
@@ -49,10 +59,14 @@ def new_game(players: list[str]) -> dict:
         "players": [{"name": n, "group": None} for n in players],
         "turn": 0,                   # index into players
         "winner": None,              # index into players, once someone wins
-        "balls": {b: {"status": "on", "x": None, "y": None}
+        # seen: found in the latest photo. x, y: where it was last seen (None = never).
+        "balls": {b: {"status": "on", "x": None, "y": None, "seen": False}
                   for b in ["cue", *map(str, range(1, 16))]},
         "history": [],               # one event per shot, newest last
         "last_advice": None,         # the coach's suggestion for the shot being played
+        "photos": 0,                 # photos processed so far
+        "photo": None,               # the latest photo's layout (what the editor shows)
+        "undo": None,                # the state just before the latest photo, for corrections
     }
 
 
@@ -98,7 +112,6 @@ def reconcile(state: dict, detections: list[dict]) -> dict:
     was last seen, and return
       balls:    the matched detections, with the remembered ball's id and type
       missing:  ids still in play, seen in an earlier photo but not in this one
-                ("cue" too, which suggests a scratch)
       rejected: detections that didn't match any ball still in play
     """
     live = on_table(state)
@@ -117,6 +130,8 @@ def reconcile(state: dict, detections: list[dict]) -> dict:
         used_ball.add(b)
         matches.append((di, b, cost))
 
+    for b in live:
+        state["balls"][b]["seen"] = b in used_ball
     balls = []
     for di, b, cost in matches:
         d = detections[di]
@@ -132,6 +147,94 @@ def reconcile(state: dict, detections: list[dict]) -> dict:
         "missing": [b for b in live if b not in used_ball and state["balls"][b]["x"] is not None],
         "rejected": [d for di, d in enumerate(detections) if di not in used_det],
     }
+
+
+def place(state: dict, layout: list[dict]) -> dict:
+    """
+    Like reconcile, but for a layout the player corrected: every ball's identity is given
+    ({"id": 1-15, or null with "type": "cue"}), so it's trusted as-is. Same return shape.
+    """
+    live = set(on_table(state))
+    balls, used = [], set()
+    for item in layout:
+        b = "cue" if item.get("type") == "cue" or item.get("id") is None else str(item["id"])
+        if b not in state["balls"]:
+            raise GameError(f"There's no ball {item.get('id')}.")
+        if b not in live:
+            raise GameError(f"Ball {b} was already pocketed in an earlier shot.")
+        if b in used:
+            raise GameError(f"Ball {'cue' if b == 'cue' else b} is in the layout twice.")
+        used.add(b)
+        state["balls"][b].update(x=float(item["x"]), y=float(item["y"]))
+        balls.append({"id": None if b == "cue" else int(b), "type": ball_type(b),
+                      "x": float(item["x"]), "y": float(item["y"]), "confidence": 1.0})
+    for b in live:
+        state["balls"][b]["seen"] = b in used
+    return {
+        "balls": balls,
+        "missing": [b for b in live if b not in used and state["balls"][b]["x"] is not None],
+        "rejected": [],
+    }
+
+
+def _snapshot(state: dict) -> dict:
+    return copy.deepcopy({k: v for k, v in state.items() if k != "undo"})
+
+
+def process_photo(state: dict, detections: list[dict], *, corrected: bool = False,
+                  intended: dict | None = None) -> dict:
+    """
+    A new photo of the table, taken after the balls stopped. Compared with the previous
+    photo it tells us what the last shot did, which is applied to the game:
+      pocketed = balls seen in the previous photo and gone now
+      scratch  = the cue ball was seen in the previous photo and is gone now
+    Nothing pocketed and nothing moved means no shot happened (a retake, or the first
+    photo), so the turn doesn't change.
+    `corrected`: the detections are a layout the player fixed by hand (see place).
+    `intended`: the shot they went for, if the app knows it (see apply_shot).
+    Returns {balls, missing, rejected, shot}: shot is the history event, or None.
+    """
+    state["undo"] = _snapshot(state)
+    first = state["photo"] is None
+    live = on_table(state)
+    before = {b: (state["balls"][b]["x"], state["balls"][b]["y"])
+              for b in live if state["balls"][b]["seen"]}
+
+    seen = place(state, detections) if corrected else reconcile(state, detections)
+    now = {b for b in live if state["balls"][b]["seen"]}
+    gone = [b for b in before if b not in now]
+    pocketed = sorted(int(b) for b in gone if b != "cue")
+    scratch = "cue" in gone
+    moved = max((math.hypot(state["balls"][b]["x"] - x, state["balls"][b]["y"] - y)
+                 for b, (x, y) in before.items() if b in now), default=0.0)
+
+    shot = None
+    if not first and state["winner"] is None and (pocketed or scratch or moved > MOVE_EPS):
+        shot = apply_shot(state, pocketed, scratch, intended)
+        shot["photo"] = state["photos"] + 1
+    state["photos"] += 1
+    state["photo"] = {"n": state["photos"], "balls": seen["balls"], "intended": intended}
+    return {**seen, "shot": shot}
+
+
+def replace_photo(state: dict, detections: list[dict], *, corrected: bool = False,
+                  intended: dict | None = None) -> dict:
+    """
+    Redo the latest photo with different detections: a retake, or the player's fixed
+    layout. Rewinds the game to just before that photo (undoing any shot it inferred),
+    then processes this instead. The replaced photo's shot event, if any, is returned in
+    `undone` so storage can drop it.
+    """
+    if state["undo"] is None:
+        raise GameError("There's no photo to correct yet. Take a photo of the table first.")
+    intended = intended or state["photo"].get("intended")   # keep what the player went for
+    undone = state["history"][-1] if state["history"] and \
+        state["history"][-1].get("photo") == state["photos"] else None
+    snapshot = state["undo"]
+    state.clear()
+    state.update(snapshot)
+    result = process_photo(state, detections, corrected=corrected, intended=intended)
+    return {**result, "undone": undone}
 
 
 # ------------------------------------------------------------------ rules
@@ -212,4 +315,6 @@ def public(state: dict) -> dict:
         "winner": state["winner"],
         "balls": {b: v["status"] for b, v in state["balls"].items()},
         "history": state["history"][-10:],
+        # latest photo: {"n", "balls", "intended"}, or None before the first
+        "layout": state["photo"],
     }

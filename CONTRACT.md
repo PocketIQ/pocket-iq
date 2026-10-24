@@ -36,8 +36,21 @@ The backend remembers each game in Tiger Data (Postgres): which balls are still 
 groups, whose turn it is. That memory is authoritative; detections are checked against it.
 Every shot is also stored for good, which is how the coach knows each player's strengths.
 
-Every photo's detections get a second opinion from Gemini on what each ball is (and
-whether it's a ball at all), unless `GEMINI_BALL_ID=off`. Positions always come from CV.
+**Shots are detected from photos; nobody types in what went in.** The flow is: photo,
+shoot, photo, shoot... Take each photo once the balls stop, before anyone touches them.
+Each photo is compared with the previous one:
+- a ball seen in the previous photo and gone now → pocketed
+- the cue ball seen in the previous photo and gone now → scratch
+- nothing pocketed and nothing moved → no shot taken (a retake); the turn doesn't change
+- a ball not seen in EITHER photo stays in play (probably hidden, not pocketed)
+
+Mistakes are fixed by correcting the latest photo's layout (`PUT /games/{id}/layout`) or
+retaking it: the game rewinds to just before that photo and replays it, so the shot it
+showed (what went in, scratch, groups, turn, winner) is recomputed. Only the latest
+photo can be corrected.
+
+Positions and ball types come from OpenCV. Optionally (`GEMINI_BALL_ID=on`, off by
+default because it's slow) Gemini double-checks which number each ball is.
 
 `Game` (returned by every game endpoint):
 ```json
@@ -48,42 +61,55 @@ whether it's a ball at all), unless `GEMINI_BALL_ID=off`. Positions always come 
   "winner": null,
   "balls": {"cue": "on", "1": "on", "2": "sunk", "...": "...", "15": "on"},
   "history": [{"t": 1761300000.0, "player": "Ana", "pocketed": [2], "scratch": false,
-               "result": "continues",
+               "result": "continues", "photo": 4,
                "intended": {"target": 2, "pocket": "top_left", "kind": "direct", "cut_angle": 18},
                "made": true, "coached": true,
-               "advice": {"target_ball": 2, "pocket": "top_left", "made": true}}]
+               "advice": {"target_ball": 2, "pocket": "top_left", "made": true}}],
+  "layout": {"n": 4, "balls": [{"id": null, "type": "cue", "x": 250, "y": 250, "confidence": 0.98}],
+             "intended": null}
 }
 ```
 - `turn`, `winner`: index into `players` (`winner` null while playing)
 - `group`: `"solid" | "stripe" | null` (null = table still open)
 - `result`: `"continues" | "turn passes" | "won" | "lost"`; `advice` is null if the coach wasn't asked
 - `intended`: the shot they went for (null if unknown); `made`: whether its target went in
+- `photo`: number of the photo that showed this shot's result
 - `history`: the last 10 shots
+- `layout`: the latest photo's balls (what the correction editor starts from); null
+  before the first photo. `n` counts photos in this game.
 
 `POST /games` `{"players": ["Ana", "Ben"]}` → `Game`
 
 `GET /games/{id}` → `Game`
 
-`POST /games/{id}/analyze` photo like `/analyze` → the `/analyze` response plus:
+`POST /games/{id}/analyze`: the next photo. Multipart: `photo` (like `/analyze`), plus
+optional `intended` (JSON string of the shot the player went for, e.g.
+`{"target": 2, "pocket": "top_left", "kind": "direct", "cut_angle": 18}`: makes their stats
+count it as made or missed) and `retake` (`"true"`: replace the latest photo instead of
+following it). Returns the `/analyze` response plus:
 ```json
-{ "missing": ["4", "cue"], "rejected": [{"type": "solid", "id": 2, "x": 10, "y": 480, "confidence": 0.4}],
+{ "missing": ["4"], "rejected": [{"type": "solid", "id": 2, "x": 10, "y": 480, "confidence": 0.4}],
+  "shot": {"player": "Ana", "pocketed": [2], "scratch": false, "result": "continues", "...": "..."},
   "game": { "...": "Game" } }
 ```
 - `balls`: only balls still in play, each with its remembered `id` and `type`
-- `missing`: in play and seen in an earlier photo, but not in this one. NOT removed: ask
-  the player if they went in (`"cue"` missing suggests a scratch)
-- `rejected`: detections that matched no ball in play, or that Gemini says aren't balls
-  (false detections), for debugging
+- `shot`: the shot this photo revealed (a `history` event), already applied to `game`.
+  null for the first photo, or when nothing moved
+- `missing`: in play but not in this photo or the previous one (hidden; still in play)
+- `rejected`: detections that matched no ball in play (false detections), for debugging
 
-`POST /games/{id}/shot` → `Game`. Records the current player's shot. 409 if it breaks the
-state (ball already pocketed, game over).
+`PUT /games/{id}/layout`: the player corrected the latest photo (moved, relabeled, added
+or removed balls). Same response as `/analyze`, with `shot` recomputed.
 ```json
-{"pocketed": [2, 5], "scratch": false,
- "intended": {"target": 2, "pocket": "top_left", "kind": "direct", "cut_angle": 18}}
+{"balls": [{"id": null, "type": "cue", "x": 400, "y": 300},
+           {"id": 9, "x": 705, "y": 250}],
+ "intended": null}
 ```
-- `intended` (optional): the shot the player selected in the app. Send it whenever you can:
-  it's what counts a shot as made or missed in their stats. Without it, the coach's
-  suggestion is used if they asked; otherwise the shot only counts toward scratches.
+- `balls`: EVERY ball on the table in the corrected layout. Identities are trusted as
+  given. A ball left out that was in the previous photo counts as pocketed by this shot.
+- `id` 1–15, or null with `"type": "cue"` for the cue ball. `x` 0–1000, `y` 0–500.
+- `intended` (optional): omit to keep the one sent with the original photo
+- 409 if a ball is listed twice or was pocketed in an earlier shot
 
 `POST /games/{id}/advice` → which shot to take and how, for the player whose turn it is.
 Request: the top shots from `physics/shots.ts` (max 12), numbered by `index`:

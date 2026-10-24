@@ -1,20 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
-import { adviceAudioUrl, analyzeGamePhoto, createGame, getAdvice, getGame, recordShot } from './api'
+import { adviceAudioUrl, analyzeGamePhoto, createGame, getAdvice, getGame } from './api'
 import { findShots, type Shot } from './physics/shots'
 import { resizeImage } from './resizeImage'
 import { TableCanvas } from './TableCanvas'
-import type { Advice, Candidate, Game, GameAnalyzeResponse } from './types'
+import type { Advice, Candidate, Game, GameAnalyzeResponse, IntendedShot, ShotEvent } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading'; what: string } | { kind: 'error'; message: string }
 
 const GAME_KEY = 'cueiq.game' // resume the game after a reload
 const SHOTS_SHOWN = 5
 const SHOTS_TO_COACH = 8
-
-const BALL_COLORS: Record<number, string> = {
-  1: '#f5c400', 2: '#1d4fd8', 3: '#d62828', 4: '#6b2fa3',
-  5: '#f77f00', 6: '#1f8a4c', 7: '#7a1f1f', 8: '#141414',
-}
 
 function errorMessage(err: unknown): string {
   return err instanceof TypeError
@@ -43,26 +38,6 @@ function toCandidates(shots: Shot[]): Candidate[] {
 }
 
 const pocketName = (p: string) => p.replace('_', ' ')
-
-function BallChip({ id, on, unseen, onClick }: { id: number; on: boolean; unseen?: boolean; onClick: () => void }) {
-  const color = BALL_COLORS[((id - 1) % 8) + 1]
-  const stripe = id > 8
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={on}
-      title={unseen ? `${id} (not seen in the last photo)` : String(id)}
-      className={`relative flex size-10 items-center justify-center rounded-full text-xs font-bold ring-offset-2 ring-offset-stone-100 dark:ring-offset-stone-950 ${on ? 'ring-4 ring-emerald-500' : unseen ? 'ring-2 ring-amber-400 ring-dashed' : ''
-        }`}
-      style={{
-        background: stripe ? `linear-gradient(#f8f6ef 28%, ${color} 28% 72%, #f8f6ef 72%)` : color,
-      }}
-    >
-      <span className="flex size-5 items-center justify-center rounded-full bg-white text-stone-900">{id}</span>
-    </button>
-  )
-}
 
 function Setup({ onStart, busy }: { onStart: (names: [string, string]) => void; busy: boolean }) {
   const [names, setNames] = useState<[string, string]>(['', ''])
@@ -160,6 +135,57 @@ function CoachCard({ advice, shot, audioUrl }: { advice: Advice; shot?: Shot; au
   )
 }
 
+// After a reload, rebuild the table view from the game's latest photo.
+function viewFromLayout(game: Game): GameAnalyzeResponse | null {
+  if (!game.layout) return null
+  return {
+    table: { width: 1000, height: 500 },
+    ball_radius: 11,
+    balls: game.layout.balls,
+    missing: [],
+    rejected: [],
+    shot: null,
+    game,
+  }
+}
+
+function describeShot(shot: ShotEvent): string {
+  const what = shot.pocketed.length ? `pocketed ${shot.pocketed.join(', ')}` : 'pocketed nothing'
+  return `${shot.player} ${what}${shot.scratch ? ' and scratched' : ''} · ${shot.result}`
+}
+
+function PhotoButton({ label, onFile, disabled, primary }: {
+  label: string
+  onFile: (file: File) => void
+  disabled: boolean
+  primary?: boolean
+}) {
+  return (
+    // capture="environment" opens the rear camera on phones; on laptops it's a file picker
+    <label
+      className={`flex cursor-pointer items-center justify-center rounded-xl px-5 font-semibold focus-within:ring-4 focus-within:ring-emerald-400 ${
+        primary
+          ? 'bg-emerald-700 py-4 text-lg text-white active:bg-emerald-800'
+          : 'bg-stone-200 py-2.5 text-sm dark:bg-stone-800'
+      }`}
+    >
+      {label}
+      <input
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        disabled={disabled}
+        onChange={e => {
+          const file = e.target.files?.[0]
+          e.target.value = '' // so picking the same photo again still fires onChange
+          if (file) onFile(file)
+        }}
+      />
+    </label>
+  )
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [game, setGame] = useState<Game | null>(null)
@@ -167,8 +193,6 @@ export default function App() {
   const [selected, setSelected] = useState(0)
   const [advice, setAdvice] = useState<Advice | null>(null)
   const [adviceCount, setAdviceCount] = useState(0) // new audio URL per piece of advice
-  const [pocketed, setPocketed] = useState<Set<number>>(new Set())
-  const [scratch, setScratch] = useState(false)
 
   const busy = status.kind === 'loading'
 
@@ -180,7 +204,13 @@ export default function App() {
     } catch {
       /* storage blocked: just start fresh */
     }
-    if (id) getGame(id).then(setGame).catch(() => localStorage.removeItem(GAME_KEY))
+    if (id)
+      getGame(id)
+        .then(g => {
+          setGame(g)
+          setView(viewFromLayout(g))
+        })
+        .catch(() => localStorage.removeItem(GAME_KEY))
   }, [])
 
   const player = game ? game.players[game.turn] : null
@@ -213,18 +243,25 @@ export default function App() {
     setAdvice(null)
   }
 
-  async function handlePhoto(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    e.target.value = '' // so picking the same photo again still fires onChange
-    if (!file || !game) return
-    const res = await run('Reading the table…', async () => analyzeGamePhoto(game.id, await resizeImage(file)))
+  // Every photo after the first shows the result of the shot before it: the backend
+  // works out what went in by comparing it with the previous photo.
+  async function handlePhoto(file: File, retake: boolean) {
+    if (!game) return
+    // The shot selected on screen is the one they went for: it's what counts as made or
+    // missed in their stats. A retake keeps what was sent with the original photo.
+    const shot = shots[selected]
+    const intended: IntendedShot | null =
+      !retake && shot?.targetId != null
+        ? { target: shot.targetId, pocket: shot.pocket, kind: shot.kind, cut_angle: shot.cutAngle }
+        : null
+    const res = await run('Reading the table…', async () =>
+      analyzeGamePhoto(game.id, await resizeImage(file), { intended, retake }),
+    )
     if (!res) return
     setView(res)
     setGame(res.game)
     setSelected(0)
     setAdvice(null)
-    setPocketed(new Set())
-    setScratch(false)
   }
 
   async function askCoach() {
@@ -234,24 +271,6 @@ export default function App() {
     setAdvice(a)
     setAdviceCount(n => n + 1)
     if (a.shot_index >= 0) setSelected(a.shot_index)
-  }
-
-  async function submitShot() {
-    if (!game) return
-    // The shot selected on screen is the one they went for: it's what counts as made or
-    // missed in their stats.
-    const shot = shots[selected]
-    const intended =
-      view && shot?.targetId != null
-        ? { target: shot.targetId, pocket: shot.pocket, kind: shot.kind, cut_angle: shot.cutAngle }
-        : null
-    const g = await run('Saving the shot…', () => recordShot(game.id, [...pocketed], scratch, intended))
-    if (!g) return
-    setGame(g)
-    setView(null) // balls moved: the old picture and shots no longer apply
-    setAdvice(null)
-    setPocketed(new Set())
-    setScratch(false)
   }
 
   function newGame() {
@@ -265,14 +284,7 @@ export default function App() {
     setAdvice(null)
   }
 
-  const inPlay = game
-    ? Object.entries(game.balls)
-      .filter(([b, s]) => s === 'on' && b !== 'cue')
-      .map(([b]) => Number(b))
-      .sort((a, b) => a - b)
-    : []
-  const missing = new Set(view?.missing ?? [])
-  const last = game?.history.at(-1)
+  const photoCount = game?.layout?.n ?? 0
 
   return (
     <main className="min-h-dvh bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
@@ -281,7 +293,7 @@ export default function App() {
           <div>
             <h1 className="text-2xl font-bold">PocketIQ</h1>
             <p className="text-sm text-stone-600 dark:text-stone-400">
-              Snap the whole table from the side. All four rails in the shot.
+              After every shot, once the balls stop, snap the whole table before anyone touches it.
             </p>
           </div>
           {game && (
@@ -303,66 +315,64 @@ export default function App() {
           <>
             <Scoreboard game={game} />
 
+            {view?.shot ? (
+              <p className="rounded-lg bg-white px-4 py-3 text-sm shadow-sm dark:bg-stone-900">
+                <span className="font-semibold">Last shot:</span> {describeShot(view.shot)}.{' '}
+                <span className="text-stone-500">Wrong? Fix the layout or retake the photo.</span>
+              </p>
+            ) : (
+              view &&
+              photoCount > 1 && (
+                <p className="rounded-lg bg-white px-4 py-3 text-sm text-stone-600 shadow-sm dark:bg-stone-900 dark:text-stone-400">
+                  Nothing moved since the last photo, so no shot was recorded.
+                </p>
+              )
+            )}
+
             {game.winner != null ? (
               <p className="rounded-xl bg-emerald-100 px-4 py-3 text-center text-lg font-semibold text-emerald-950 dark:bg-emerald-950 dark:text-emerald-100">
                 {game.players[game.winner].name} wins!
               </p>
             ) : (
-              <>
-                {last && !view && (
-                  <p className="text-sm text-stone-600 dark:text-stone-400">
-                    Last shot: {last.player} pocketed {last.pocketed.join(', ') || 'nothing'}
-                    {last.scratch && ' and scratched'} · {last.result}. {player?.name}, take a photo for your shot.
-                  </p>
-                )}
-
-                {/* capture="environment" opens the rear camera on phones; on laptops it's a file picker */}
-                <label className="flex items-center justify-center rounded-xl bg-emerald-700 px-5 py-4 text-lg font-semibold text-white active:bg-emerald-800 cursor-pointer focus-within:ring-4 focus-within:ring-emerald-400">
-                  {busy ? status.what : view ? 'Retake photo' : `Photo for ${player?.name}’s shot`}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    capture="environment"
-                    className="sr-only"
-                    onChange={handlePhoto}
-                    disabled={busy}
-                  />
-                </label>
-              </>
+              <PhotoButton
+                primary
+                disabled={busy}
+                onFile={f => handlePhoto(f, false)}
+                label={
+                  busy ? status.what : photoCount === 0 ? 'Photo of the table' : `Photo after ${player?.name}’s shot`
+                }
+              />
+            )}
+            {photoCount > 0 && (
+              <PhotoButton disabled={busy} onFile={f => handlePhoto(f, true)} label="Retake the last photo" />
             )}
 
             {view && game.winner == null && (
               <>
-                {view.missing.length > 0 && (
-                  <p className="rounded-lg bg-amber-100 px-4 py-3 text-sm text-amber-950 dark:bg-amber-950 dark:text-amber-100">
-                    Didn’t see {view.missing.map(b => (b === 'cue' ? 'the cue ball' : b)).join(', ')}. Hidden, or
-                    pocketed? Balls stay in play until you mark them pocketed below.
-                  </p>
-                )}
-
                 <section className="flex flex-col gap-2">
                   <TableCanvas data={view} shots={shots.slice(0, SHOTS_SHOWN)} selected={selected} />
                   <p className="text-xs text-stone-500">
                     {view.balls.length} balls · dashed ring = unsure
+                    {view.missing.length > 0 &&
+                      ` · not seen: ${view.missing.map(b => (b === 'cue' ? 'cue ball' : b)).join(', ')} (still in play)`}
                     {view.rejected.length > 0 && ` · ignored ${view.rejected.length} false detection(s)`}
                   </p>
                 </section>
 
                 {shots.length > 0 ? (
-                  <div className="flex flex-col gap-2">
-                    <div className="flex flex-wrap gap-2">
-                      {shots.slice(0, SHOTS_SHOWN).map((s, i) => (
-                        <button
-                          key={i}
-                          onClick={() => setSelected(i)}
-                          aria-pressed={selected === i}
-                          className={`rounded-lg px-3 py-1.5 text-sm ${selected === i ? 'bg-stone-900 text-white dark:bg-white dark:text-stone-900' : 'bg-stone-200 dark:bg-stone-800'
-                            }`}
-                        >
-                          {s.targetId ?? '?'} → {pocketName(s.pocket)} · {s.cutAngle}°{s.kind === 'bank' && ' bank'}
-                        </button>
-                      ))}
-                    </div>
+                  <div className="flex flex-wrap gap-2">
+                    {shots.slice(0, SHOTS_SHOWN).map((s, i) => (
+                      <button
+                        key={i}
+                        onClick={() => setSelected(i)}
+                        aria-pressed={selected === i}
+                        className={`rounded-lg px-3 py-1.5 text-sm ${
+                          selected === i ? 'bg-stone-900 text-white dark:bg-white dark:text-stone-900' : 'bg-stone-200 dark:bg-stone-800'
+                        }`}
+                      >
+                        {s.targetId ?? '?'} → {pocketName(s.pocket)} · {s.cutAngle}°{s.kind === 'bank' && ' bank'}
+                      </button>
+                    ))}
                   </div>
                 ) : (
                   <p className="text-sm text-stone-600 dark:text-stone-400">No clear shot at a legal ball. Ask the coach for a safety.</p>
@@ -384,41 +394,6 @@ export default function App() {
                   />
                 )}
               </>
-            )}
-
-            {game.winner == null && (
-              <section className="flex flex-col gap-3 rounded-xl bg-white p-4 shadow-sm dark:bg-stone-900">
-                <h2 className="font-semibold">After {player?.name}’s shot: what went in?</h2>
-                <div className="flex flex-wrap gap-2">
-                  {inPlay.map(id => (
-                    <BallChip
-                      key={id}
-                      id={id}
-                      on={pocketed.has(id)}
-                      unseen={missing.has(String(id))}
-                      onClick={() =>
-                        setPocketed(s => {
-                          const next = new Set(s)
-                          if (next.has(id)) next.delete(id)
-                          else next.add(id)
-                          return next
-                        })
-                      }
-                    />
-                  ))}
-                </div>
-                <label className="flex items-center gap-2 text-sm">
-                  <input type="checkbox" checked={scratch} onChange={e => setScratch(e.target.checked)} className="size-4" />
-                  Scratched (cue ball went in){missing.has('cue') && ' · the cue ball wasn’t seen'}
-                </label>
-                <button
-                  onClick={submitShot}
-                  disabled={busy}
-                  className="rounded-xl bg-emerald-700 px-5 py-3 font-semibold text-white active:bg-emerald-800 disabled:opacity-60"
-                >
-                  {pocketed.size || scratch ? 'Record shot' : 'Nothing went in: next turn'}
-                </button>
-              </section>
             )}
           </>
         )}

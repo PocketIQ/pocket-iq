@@ -32,6 +32,7 @@ export interface ShotEvent {
   intended: IntendedShot | null // the shot they went for
   made: boolean | null // whether its target went in
   coached: boolean
+  photo: number // the photo that showed this shot's result
   advice: { target_ball: number | null; pocket: string | null; made: boolean } | null
 }
 
@@ -42,12 +43,23 @@ export interface Game {
   winner: 0 | 1 | null
   balls: Record<string, 'on' | 'sunk'> // "cue", "1".."15"
   history: ShotEvent[]
+  // The latest photo's layout (what the correction editor shows); null before the first photo
+  layout: { n: number; balls: Ball[]; intended: IntendedShot | null } | null
 }
 
 export interface GameAnalyzeResponse extends AnalyzeResponse {
-  missing: string[] // in play but not seen: ask the player, never assume pocketed
+  missing: string[] // in play, not seen now or in the previous photo: probably hidden
   rejected: Ball[] // detections that matched no ball still in play
+  shot: ShotEvent | null // the shot this photo revealed; null for the first photo or no change
   game: Game
+}
+
+/** One ball in a corrected layout: its identity is trusted as given. */
+export interface LayoutBall {
+  id: number | null // null = cue ball
+  type?: BallType // send 'cue' for the cue ball
+  x: number
+  y: number
 }
 
 export interface IntendedShot {

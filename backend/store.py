@@ -41,8 +41,10 @@ create table if not exists shots (
     scratch boolean not null,
     coached boolean not null,      -- they asked the coach first
     speed text,
-    spin text
+    spin text,
+    photo int                      -- the photo that showed this shot's result
 );
+alter table shots add column if not exists photo int;
 create index if not exists shots_player_t on shots (player, t desc);
 """
 
@@ -115,17 +117,28 @@ def save_game(state: dict) -> None:
 
 
 # ------------------------------------------------------------------ shots
-def save_shot(state: dict, event: dict) -> None:
-    """Save the game and record the shot (game.apply_shot's event) together: either both
-    land or neither does, so the stats never disagree with the game."""
-    shot = event.get("intended") or {}
-    _run((_SAVE_GAME, (state["_id"], Jsonb(state))),
-         ("""insert into shots (game_id, player, target, pocket, kind, cut_angle, made,
-                                pocketed, scratch, coached, speed, spin)
-             values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-          (state["_id"], event["player"].strip().lower(), shot.get("target"), shot.get("pocket"),
-           shot.get("kind"), shot.get("cut_angle"), event.get("made"), event["pocketed"],
-           event["scratch"], bool(event.get("coached")), shot.get("speed"), shot.get("spin"))))
+def save_photo(state: dict, shot: dict | None, undone: dict | None = None) -> None:
+    """
+    Save the game after a photo, together with what it changed in the shot history:
+    the shot it showed (game.process_photo's event), and, for a correction, removing the
+    shot the replaced photo had shown. All in one transaction, so the stats never
+    disagree with the game.
+    """
+    statements = [(_SAVE_GAME, (state["_id"], Jsonb(state)))]
+    if undone is not None:
+        statements.append(("delete from shots where game_id = %s and photo = %s",
+                           (state["_id"], undone["photo"])))
+    if shot is not None:
+        intended = shot.get("intended") or {}
+        statements.append((
+            """insert into shots (game_id, player, target, pocket, kind, cut_angle, made,
+                                  pocketed, scratch, coached, speed, spin, photo)
+               values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (state["_id"], shot["player"].strip().lower(), intended.get("target"),
+             intended.get("pocket"), intended.get("kind"), intended.get("cut_angle"),
+             shot.get("made"), shot["pocketed"], shot["scratch"], bool(shot.get("coached")),
+             intended.get("speed"), intended.get("spin"), shot.get("photo"))))
+    _run(*statements)
 
 
 CUT_BUCKETS = "case when cut_angle < 15 then '0-15' when cut_angle < 30 then '15-30' " \

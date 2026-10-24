@@ -7,10 +7,10 @@ load_dotenv()  # reads backend/.env into os.environ
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
-from fastapi import FastAPI, File, HTTPException, UploadFile  # noqa: E402
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import Response  # noqa: E402
-from pydantic import BaseModel, Field, field_validator  # noqa: E402
+from pydantic import BaseModel, Field, ValidationError, field_validator  # noqa: E402
 
 import ball_id  # noqa: E402
 import coach  # noqa: E402
@@ -105,9 +105,16 @@ class Intended(BaseModel):
     cut_angle: float
 
 
-class ShotResult(BaseModel):
-    pocketed: list[int] = []
-    scratch: bool = False
+class LayoutBall(BaseModel):
+    """One ball in a layout the player corrected: its identity is trusted as given."""
+    id: int | None = Field(default=None, ge=1, le=15)   # null = the cue ball
+    type: str | None = None                              # "cue" for the cue ball; else optional
+    x: float = Field(ge=0, le=TABLE_W)
+    y: float = Field(ge=0, le=TABLE_H)
+
+
+class Layout(BaseModel):
+    balls: list[LayoutBall] = Field(max_length=16)
     intended: Intended | None = None
 
 
@@ -139,41 +146,68 @@ def get_game(game_id: str):
     return game.public(_load(game_id))
 
 
-@app.post("/games/{game_id}/analyze")
-async def analyze_in_game(game_id: str, photo: UploadFile = File(...)):
-    """
-    Like /analyze, but checked against the game's memory: only balls still in play can be
-    detected, each keeps its identity between photos, and balls not seen are reported as
-    `missing` for the player to confirm (never removed automatically).
-    """
-    state = _load(game_id)
-    balls, not_balls = _vision(await _read_photo(photo))
-    seen = game.reconcile(state, balls)
-    _save(state)
+def _photo_result(state: dict, result: dict, not_balls: list[dict] = ()) -> dict:
+    try:   # the game + the coach's long-term memory, together
+        store.save_photo(state, result["shot"], result.get("undone"))
+    except store.StoreError as e:
+        raise HTTPException(503, str(e))
     return {
         "table": {"width": TABLE_W, "height": TABLE_H},
         "ball_radius": BALL_RADIUS,
-        "balls": seen["balls"],
-        "missing": seen["missing"],
-        "rejected": seen["rejected"] + not_balls,
+        "balls": result["balls"],
+        "missing": result["missing"],
+        "rejected": result["rejected"] + list(not_balls),
+        "shot": result["shot"],
         "game": game.public(state),
     }
 
 
-@app.post("/games/{game_id}/shot")
-def record_shot(game_id: str, body: ShotResult):
-    """The current player took a shot: these balls went in (confirmed by the player)."""
+@app.post("/games/{game_id}/analyze")
+async def analyze_in_game(
+    game_id: str,
+    photo: UploadFile = File(...),
+    intended: str | None = Form(None),
+    retake: bool = Form(False),
+):
+    """
+    The next photo of the table, taken once the balls stop. Checked against the game's
+    memory (only balls still in play can be detected, each keeps its identity), and
+    compared with the previous photo to work out the shot in between: balls that
+    disappeared went in, a missing cue ball is a scratch. That shot is applied to the
+    game (turns, groups, winner) and returned as `shot`.
+    `intended`: JSON of the shot the player went for (makes their stats count it).
+    `retake`: this photo replaces the latest one instead of following it.
+    """
     state = _load(game_id)
     try:
-        event = game.apply_shot(state, body.pocketed, body.scratch,
-                                body.intended and body.intended.model_dump())
+        meant = Intended.model_validate_json(intended).model_dump() if intended else None
+    except ValidationError as e:
+        raise HTTPException(422, f"`intended` isn't a valid shot: {e.errors()[0]['msg']}")
+    balls, not_balls = _vision(await _read_photo(photo))
+    try:
+        if retake:
+            result = game.replace_photo(state, balls, intended=meant)
+        else:
+            result = game.process_photo(state, balls, intended=meant)
     except game.GameError as e:
         raise HTTPException(409, str(e))
+    return _photo_result(state, result, not_balls)
+
+
+@app.put("/games/{game_id}/layout")
+def correct_layout(game_id: str, body: Layout):
+    """
+    The player fixed the latest photo's layout (moved, relabeled, added or removed balls).
+    The game rewinds to before that photo and replays it with this layout, so the shot
+    it showed (what went in, scratch, whose turn) is recomputed from the corrected balls.
+    """
+    state = _load(game_id)
     try:
-        store.save_shot(state, event)   # the game + the coach's long-term memory, together
-    except store.StoreError as e:
-        raise HTTPException(503, str(e))
-    return game.public(state)
+        result = game.replace_photo(state, [b.model_dump() for b in body.balls], corrected=True,
+                                    intended=body.intended and body.intended.model_dump())
+    except game.GameError as e:
+        raise HTTPException(409, str(e))
+    return _photo_result(state, result)
 
 
 @app.post("/games/{game_id}/advice")
@@ -186,7 +220,7 @@ def advice(game_id: str, body: AdviceRequest):
         result = coach.advise(state, [c.model_dump() for c in body.candidates])
     except coach.CoachError as e:
         raise HTTPException(502, str(e))
-    _save(state)   # keeps the suggestion, so /shot knows what was coached
+    _save(state)   # keeps the suggestion, so the next photo's shot knows it was coached
     return result
 
 
