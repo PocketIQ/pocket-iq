@@ -24,6 +24,39 @@ function polyline(ctx: CanvasRenderingContext2D, pts: Vec[]) {
   ctx.stroke()
 }
 
+/** Nearest ball to a pointer, in table units. 2 radii, then 3 if that misses. */
+function ballIndexAt(data: AnalyzeResponse, canvas: HTMLCanvasElement, clientX: number, clientY: number): number | null {
+  const rect = canvas.getBoundingClientRect()
+  const TW = data.table.width
+  const s = rect.width / (TW + 2 * RAIL)
+  const tx = (clientX - rect.left) / s - RAIL
+  const ty = (clientY - rect.top) / s - RAIL
+  const r = data.ball_radius
+
+  let nearest = -1
+  let nearestDist = Infinity
+  for (let i = 0; i < data.balls.length; i++) {
+    const ball = data.balls[i]
+    const dist = Math.hypot(ball.x - tx, ball.y - ty)
+    if (dist < nearestDist) {
+      nearest = i
+      nearestDist = dist
+    }
+  }
+  if (nearest < 0) return null
+  if (nearestDist <= 2 * r) return nearest
+  if (nearestDist <= 3 * r) return nearest
+  return null
+}
+
+type Press = {
+  pointerId: number
+  x: number
+  y: number
+  index: number
+  moved: boolean
+}
+
 function drawShot(ctx: CanvasRenderingContext2D, shot: Shot, r: number, active: boolean) {
   ctx.globalAlpha = active ? 1 : 0.25
   ctx.lineCap = 'round'
@@ -54,12 +87,45 @@ export function TableCanvas({
   data,
   shots = [],
   selected = 0,
+  showConfidence = true,
+  onBallTap,
 }: {
   data: AnalyzeResponse
   shots?: Shot[]
   selected?: number
+  showConfidence?: boolean
+  onBallTap?: (index: number) => void
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
+  const press = useRef<Press | null>(null)
+
+  function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (e.button !== 0 || !onBallTap) return
+    const canvas = ref.current
+    if (!canvas) return
+    const index = ballIndexAt(data, canvas, e.clientX, e.clientY)
+    if (index == null) return
+    e.preventDefault()
+    try {
+      canvas.setPointerCapture(e.pointerId)
+    } catch {
+      // Synthetic events have no pointer to capture.
+    }
+    press.current = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, index, moved: false }
+  }
+
+  function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    const current = press.current
+    if (!current || current.pointerId !== e.pointerId || current.moved) return
+    if (Math.hypot(e.clientX - current.x, e.clientY - current.y) > 10) current.moved = true
+  }
+
+  function endPress(e: React.PointerEvent<HTMLCanvasElement>, tap: boolean) {
+    const current = press.current
+    if (!current || current.pointerId !== e.pointerId) return
+    press.current = null
+    if (tap && !current.moved) onBallTap?.(current.index)
+  }
 
   useEffect(() => {
     const canvas = ref.current
@@ -124,12 +190,13 @@ export function TableCanvas({
           ctx.fill()
         }
 
-        // Dashed ring = low confidence. The Correction UI will use this.
-        ctx.lineWidth = 1.5
-        ctx.setLineDash(b.confidence < 0.7 ? [4, 3] : [])
-        ctx.strokeStyle = b.confidence < 0.7 ? '#ffd166' : 'rgba(0,0,0,0.5)'
+        // Low confidence stays a dashed ring, thicker and brighter so it reads on a phone.
+        const low = showConfidence && b.confidence < 0.7
+        ctx.lineWidth = low ? 5 : 1.5
+        ctx.setLineDash(low ? [8, 5] : [])
+        ctx.strokeStyle = low ? '#ffe14a' : 'rgba(0,0,0,0.5)'
         ctx.beginPath()
-        ctx.arc(b.x, b.y, r + (b.confidence < 0.7 ? 4 : 0), 0, Math.PI * 2)
+        ctx.arc(b.x, b.y, r + (low ? 6 : 0), 0, Math.PI * 2)
         ctx.stroke()
         ctx.setLineDash([])
 
@@ -147,7 +214,17 @@ export function TableCanvas({
     draw()
     window.addEventListener('resize', draw)
     return () => window.removeEventListener('resize', draw)
-  }, [data, shots, selected])
+  }, [data, shots, selected, showConfidence])
 
-  return <canvas ref={ref} className="w-full block" />
+  return (
+    <canvas
+      ref={ref}
+      className="w-full block touch-none select-none"
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={(e) => endPress(e, true)}
+      onPointerCancel={(e) => endPress(e, false)}
+      onContextMenu={(e) => e.preventDefault()}
+    />
+  )
 }

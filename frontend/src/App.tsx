@@ -1,12 +1,47 @@
 import { useEffect, useMemo, useState } from 'react'
 import { analyzePhoto } from './api'
+import { EditToolbar } from './EditToolbar'
+import { MOCK_TABLE } from './mockTable'
 import { findShots } from './physics/shots'
 import { resizeImage } from './resizeImage'
 import { TableCanvas } from './TableCanvas'
+import type { Tool } from './EditToolbar'
 import type { Group } from './physics/shots'
-import type { AnalyzeResponse } from './types'
+import type { AnalyzeResponse, Ball } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading' } | { kind: 'error'; message: string }
+
+type History = { past: Ball[][]; future: Ball[][] }
+
+const EMPTY_HISTORY: History = { past: [], future: [] }
+
+/** Returns the same array when the tap changes nothing, so it doesn't land in history. */
+function applyTool(balls: Ball[], index: number, tool: Tool): Ball[] {
+  const target = balls[index]
+  if (!target) return balls
+  if (tool === 'remove') return balls.filter((_, i) => i !== index)
+
+  if (tool === 'flip') {
+    // Cue/8 flip to solid so a misdetected cue or 8 can still be fixed.
+    const type = target.type === 'solid' ? 'stripe' : 'solid'
+    return balls.map((ball, i) => (i === index ? { ...ball, type, confidence: 1 } : ball))
+  }
+
+  if (target.type === tool) return balls
+  // Only one cue and one 8: the old one becomes a solid.
+  return balls.map((ball, i) => {
+    if (i === index) return { ...ball, type: tool, id: tool === 'eight' ? 8 : null, confidence: 1 }
+    if (ball.type === tool) return { ...ball, type: 'solid' as const, id: null, confidence: 1 }
+    return ball
+  })
+}
+
+const TOOL_HINTS: Record<Tool, string> = {
+  flip: 'Tap a ball to swap solid and stripe.',
+  cue: 'Tap the real cue ball.',
+  eight: 'Tap the real 8 ball.',
+  remove: 'Tap a ball that isn’t really there.',
+}
 
 const GROUPS: { value: Group; label: string }[] = [
   { value: 'solid', label: 'Solids' },
@@ -25,12 +60,52 @@ export default function App() {
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
   const [group, setGroup] = useState<Group>(null)
   const [selected, setSelected] = useState(0)
+  const [confirmed, setConfirmed] = useState(false)
+  const [tool, setTool] = useState<Tool>('flip')
+  const [history, setHistory] = useState<History>(EMPTY_HISTORY)
 
-  const shots = useMemo(() => result ? findShots(result.balls, result.table, result.ball_radius, group) : [], [result, group])
+  const needsCheck = result ? result.balls.filter((ball) => ball.confidence < 0.7).length : 0
+
+  const shots = useMemo(
+    () => (result && confirmed ? findShots(result.balls, result.table, result.ball_radius, group) : []),
+    [result, group, confirmed],
+  )
 
   useEffect(() => {
     setSelected(0)
   }, [shots])
+
+  function loadResult(next: AnalyzeResponse) {
+    setResult(next)
+    setConfirmed(false)
+    setHistory(EMPTY_HISTORY)
+    setStatus({ kind: 'idle' })
+  }
+
+  function onBallTap(index: number) {
+    if (!result) return
+    const balls = applyTool(result.balls, index, tool)
+    if (balls === result.balls) return
+    setHistory({ past: [...history.past, result.balls], future: [] })
+    setResult({ ...result, balls })
+    setConfirmed(false)
+  }
+
+  function undo() {
+    const prev = history.past.at(-1)
+    if (!result || !prev) return
+    setHistory({ past: history.past.slice(0, -1), future: [result.balls, ...history.future] })
+    setResult({ ...result, balls: prev })
+    setConfirmed(false)
+  }
+
+  function redo() {
+    const [next, ...rest] = history.future
+    if (!result || !next) return
+    setHistory({ past: [...history.past, result.balls], future: rest })
+    setResult({ ...result, balls: next })
+    setConfirmed(false)
+  }
 
   async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
@@ -40,8 +115,7 @@ export default function App() {
     setStatus({ kind: 'loading' })
     try {
       const small = await resizeImage(file)
-      setResult(await analyzePhoto(small))
-      setStatus({ kind: 'idle' })
+      loadResult(await analyzePhoto(small))
     } catch (err) {
       setStatus({
         kind: 'error',
@@ -77,6 +151,17 @@ export default function App() {
           />
         </label>
 
+        {/* Dev only: skip the camera + backend and load a canned table */}
+        {import.meta.env.DEV && (
+          <button
+            type="button"
+            onClick={() => loadResult(structuredClone(MOCK_TABLE))}
+            className="rounded-xl border border-dashed border-stone-400 px-5 py-2 text-sm font-semibold text-stone-600 dark:text-stone-400"
+          >
+            Load test table
+          </button>
+        )}
+
         {status.kind === 'error' && (
           <p role="alert" className="rounded-lg bg-red-100 px-4 py-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-200">
             {status.message}
@@ -85,37 +170,84 @@ export default function App() {
 
         {result && (
           <section className="flex flex-col gap-2">
-            <div role="group" aria-label="Group" className="grid grid-cols-3 gap-1 rounded-xl bg-stone-200 p-1 dark:bg-stone-800">
-              {GROUPS.map((option) => {
-                const active = group === option.value
-                return (
-                  <button
-                    key={option.label}
-                    type="button"
-                    aria-pressed={active}
-                    onClick={() => setGroup(option.value)}
-                    className={`rounded-lg px-2 py-2 text-sm font-semibold ${
-                      active
-                        ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-950 dark:text-stone-100'
-                        : 'text-stone-600 dark:text-stone-400'
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                )
-              })}
-            </div>
+            {confirmed && (
+              <div role="group" aria-label="Group" className="grid grid-cols-3 gap-1 rounded-xl bg-stone-200 p-1 dark:bg-stone-800">
+                {GROUPS.map((option) => {
+                  const active = group === option.value
+                  return (
+                    <button
+                      key={option.label}
+                      type="button"
+                      aria-pressed={active}
+                      onClick={() => setGroup(option.value)}
+                      className={`rounded-lg px-2 py-2 text-sm font-semibold ${
+                        active
+                          ? 'bg-white text-stone-900 shadow-sm dark:bg-stone-950 dark:text-stone-100'
+                          : 'text-stone-600 dark:text-stone-400'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  )
+                })}
+              </div>
+            )}
 
-            <TableCanvas data={result} shots={shots.slice(0, 3)} selected={selected} />
-            <p className="text-xs text-stone-500">
-              {result.balls.length} balls · dashed ring = low confidence
-              {result.debug?.markers_used &&
-                ` · markers ${result.debug.markers_used.join(', ')}`}
-              {result.debug &&
-                ` · ${result.debug.image_size.join('×')}`}
-            </p>
+            {!confirmed && needsCheck > 0 && (
+              <p className="text-sm font-semibold text-amber-700 dark:text-amber-300">
+                {needsCheck} {needsCheck === 1 ? 'ball needs' : 'balls need'} a check
+              </p>
+            )}
 
-            {shots.length === 0 ? (
+            {!confirmed && (
+              <EditToolbar
+                tool={tool}
+                onToolChange={setTool}
+                canUndo={history.past.length > 0}
+                canRedo={history.future.length > 0}
+                onUndo={undo}
+                onRedo={redo}
+              />
+            )}
+
+            <TableCanvas
+              data={result}
+              shots={shots.slice(0, 3)}
+              selected={selected}
+              showConfidence={!confirmed}
+              onBallTap={confirmed ? undefined : onBallTap}
+            />
+
+            {!confirmed ? (
+              <>
+                <p className="text-sm text-stone-600 dark:text-stone-400">{TOOL_HINTS[tool]}</p>
+                <p className="text-xs text-stone-500">
+                  {result.balls.length} balls · dashed ring = low confidence
+                  {result.debug?.markers_used &&
+                    ` · markers ${result.debug.markers_used.join(', ')}`}
+                  {result.debug &&
+                    ` · ${result.debug.image_size.join('×')}`}
+                </p>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmed(false)}
+                className="self-start py-2 text-sm font-semibold text-emerald-800 dark:text-emerald-300"
+              >
+                Edit layout
+              </button>
+            )}
+
+            {!confirmed ? (
+              <button
+                type="button"
+                onClick={() => setConfirmed(true)}
+                className="flex items-center justify-center rounded-xl bg-emerald-700 px-5 py-4 text-lg font-semibold text-white active:bg-emerald-800"
+              >
+                Confirm layout
+              </button>
+            ) : shots.length === 0 ? (
               <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 dark:bg-stone-900 dark:text-stone-400">
                 No clear shot found
               </p>
