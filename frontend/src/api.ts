@@ -7,6 +7,7 @@ import type {
   IntendedShot,
   LayoutBall,
   PlayerStats,
+  ShotPhysics,
 } from './types'
 
 export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
@@ -72,3 +73,18 @@ export const getAdvice = (id: string, candidates: Candidate[]) =>
 export const adviceAudioUrl = (id: string, nonce: number) => `${API_URL}/games/${id}/advice/audio?n=${nonce}`
 
 export const getStats = (name: string) => request<PlayerStats>(`/players/${encodeURIComponent(name)}/stats`)
+
+/**
+ * What happens if the current player hits this shot with this power and spin: for
+ * previewing the spin indicator and power bar live. The shot is one from findShots.
+ */
+export const simulateShot = (
+  id: string,
+  shot: { target_id: number; pocket: string; kind: 'direct' | 'bank'; cut_angle?: number },
+  power: number,
+  spin: { x: number; y: number },
+) =>
+  request<ShotPhysics & { speed: Advice['speed']; spin_name: Advice['spin'] }>(
+    `/games/${id}/simulate`,
+    json({ ...shot, power, spin }),
+  )

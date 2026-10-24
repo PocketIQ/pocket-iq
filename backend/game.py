@@ -284,7 +284,9 @@ def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict |
         intended = {"target": advice["target_ball"], "pocket": advice.get("pocket"),
                     "kind": advice.get("kind"), "cut_angle": advice.get("cut_angle")}
     if intended is not None and advice and advice.get("target_ball") == intended.get("target"):
-        intended = {**intended, "speed": advice.get("speed"), "spin": advice.get("spin")}
+        spin_xy = advice.get("spin_xy") or {}
+        intended = {**intended, "speed": advice.get("speed"), "spin": advice.get("spin"),
+                    "power": advice.get("power"), "spin_x": spin_xy.get("x"), "spin_y": spin_xy.get("y")}
     event = {
         "t": time.time(),
         "player": me["name"],
