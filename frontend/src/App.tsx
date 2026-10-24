@@ -76,7 +76,11 @@ function setBall(balls: Ball[], index: number, n: number): Ball[] {
   if (!target) return balls
   const type = n === 0 ? 'cue' : n === 8 ? 'eight' : n < 8 ? 'solid' : 'stripe'
   const id = n === 0 ? null : n
-  if (target.type === type && target.id === id) return balls
+  if (target.type === type && target.id === id) {
+    // Picking the same label confirms it: the ball stops being flagged as unsure.
+    if (target.confidence >= 1) return balls
+    return balls.map((ball, i) => (i === index ? { ...ball, confidence: 1 } : ball))
+  }
   // Each ball exists once: whichever ball had this label swaps to the tapped ball's old one.
   return balls.map((ball, i) => {
     if (i === index) return { ...ball, type, id, confidence: 1 }
