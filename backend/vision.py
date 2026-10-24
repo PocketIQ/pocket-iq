@@ -58,14 +58,34 @@ _params = cv2.aruco.DetectorParameters()
 # Sub-pixel corner refinement: locates marker corners between pixels. Matters more the
 # smaller the markers are, since each pixel of error is a bigger share of the marker.
 _params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+# Tuned for small, far-away markers (defaults are built for big, close ones):
+# - Default rejects any marker whose outline is under 3% of the image's longest side.
+#   In a 3000px photo that throws away every marker under ~22px wide BEFORE trying to
+#   read it, which is exactly the far markers. 0.5% keeps them.
+_params.minMarkerPerimeterRate = 0.005
+_params.minCornerDistanceRate = 0.02
+# Try smaller thresholding windows, so a tiny marker isn't averaged into the felt.
+_params.adaptiveThreshWinSizeMin = 3
+_params.adaptiveThreshWinSizeMax = 53
+_params.adaptiveThreshWinSizeStep = 4
+# Far markers are seen at a steep angle, so their outline is a squashed, slightly
+# blurry quadrilateral. Be more forgiving when matching the outline to a 4-sided shape.
+_params.polygonalApproxAccuracyRate = 0.05
+# Sample each cell of the marker with more pixels when reading its bits.
+_params.perspectiveRemovePixelPerCell = 8
+_params.perspectiveRemoveIgnoredMarginPerCell = 0.2
 _detector = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(ARUCO_DICT), _params)
 
 
 # ---------------------------------------------------------------- 1. markers
+def detect_raw(img: np.ndarray):
+    """Raw ArUco output: (corners, ids, rejected candidates). Used by the debug tool."""
+    return _detector.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+
+
 def find_markers(img: np.ndarray) -> dict[int, np.ndarray]:
     """Return {marker_id: (x, y) center in photo pixels} for every known marker found."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = _detector.detectMarkers(gray)
+    corners, ids, _ = detect_raw(img)
     found = {}
     if ids is not None:
         for quad, mid in zip(corners, ids.flatten()):
@@ -105,13 +125,7 @@ def compute_homography(markers: dict[int, np.ndarray]) -> tuple[np.ndarray, list
     src = np.float32([markers[i] for i in ids])
     dst = np.float32([MARKERS[i][1] for i in ids])
     if len(ids) == 4:
-        try:
-            return cv2.getPerspectiveTransform(src, dst), []  # exact fit, nothing to check
-        except cv2.error as e:
-            raise VisionError(
-                "Couldn't lock onto the table from those four markers. "
-                "Make sure they are flat, fully in frame, and in the labeled corners."
-            ) from e
+        return cv2.getPerspectiveTransform(src, dst), []  # exact fit, nothing to check
 
     H, worst = _fit(markers, ids)
     if H is None or worst > MAX_MARKER_ERROR:
@@ -208,7 +222,8 @@ def analyze_image(img: np.ndarray) -> VisionResult:
         missing = [MARKERS[i][0] for i in MARKERS if i not in markers]
         raise VisionError(
             f"Found {len(markers)} of {len(MARKERS)} markers (need at least {MIN_MARKERS}). "
-            f"Missing: {', '.join(missing)}. Step back so more of them are in frame."
+            f"Missing: {', '.join(missing)}. Hold the phone higher, or shoot from the middle "
+            "of the long side so the far markers aren't at such a steep angle."
         )
 
     H, rejected = compute_homography(markers)
