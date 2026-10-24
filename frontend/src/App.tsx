@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { analyzePhoto } from './api'
+import { BallPicker } from './BallPicker'
 import { EditToolbar } from './EditToolbar'
 import { MOCK_TABLE } from './mockTable'
 import { findShots } from './physics/shots'
 import { resizeImage } from './resizeImage'
-import { TableCanvas } from './TableCanvas'
+import { RAIL, TableCanvas } from './TableCanvas'
 import type { Tool } from './EditToolbar'
 import type { Group } from './physics/shots'
 import type { AnalyzeResponse, Ball } from './types'
@@ -15,31 +16,24 @@ type History = { past: Ball[][]; future: Ball[][] }
 
 const EMPTY_HISTORY: History = { past: [], future: [] }
 
-/** Returns the same array when the tap changes nothing, so it doesn't land in history. */
-function applyTool(balls: Ball[], index: number, tool: Tool): Ball[] {
+/** Labels a ball as the cue (0) or a numbered ball. Same array back if nothing changes. */
+function setBall(balls: Ball[], index: number, n: number): Ball[] {
   const target = balls[index]
   if (!target) return balls
-  if (tool === 'remove') return balls.filter((_, i) => i !== index)
-
-  if (tool === 'flip') {
-    // Cue/8 flip to solid so a misdetected cue or 8 can still be fixed.
-    const type = target.type === 'solid' ? 'stripe' : 'solid'
-    return balls.map((ball, i) => (i === index ? { ...ball, type, confidence: 1 } : ball))
-  }
-
-  if (target.type === tool) return balls
-  // Only one cue and one 8: the old one becomes a solid.
+  const type = n === 0 ? 'cue' : n === 8 ? 'eight' : n < 8 ? 'solid' : 'stripe'
+  const id = n === 0 ? null : n
+  if (target.type === type && target.id === id) return balls
+  // Each ball exists once: whichever ball had this label loses it.
   return balls.map((ball, i) => {
-    if (i === index) return { ...ball, type: tool, id: tool === 'eight' ? 8 : null, confidence: 1 }
-    if (ball.type === tool) return { ...ball, type: 'solid' as const, id: null, confidence: 1 }
+    if (i === index) return { ...ball, type, id, confidence: 1 }
+    if (type === 'cue' && ball.type === 'cue') return { ...ball, type: 'solid' as const, id: null, confidence: 1 }
+    if (id != null && ball.id === id) return { ...ball, type: id === 8 ? 'solid' as const : ball.type, id: null, confidence: 1 }
     return ball
   })
 }
 
 const TOOL_HINTS: Record<Tool, string> = {
-  flip: 'Tap a ball to swap solid and stripe.',
-  cue: 'Tap the real cue ball.',
-  eight: 'Tap the real 8 ball.',
+  label: 'Tap a ball to say which one it is.',
   remove: 'Tap a ball that isn’t really there.',
 }
 
@@ -61,7 +55,8 @@ export default function App() {
   const [group, setGroup] = useState<Group>(null)
   const [selected, setSelected] = useState(0)
   const [confirmed, setConfirmed] = useState(false)
-  const [tool, setTool] = useState<Tool>('flip')
+  const [tool, setTool] = useState<Tool>('label')
+  const [picking, setPicking] = useState<number | null>(null)
   const [history, setHistory] = useState<History>(EMPTY_HISTORY)
 
   const needsCheck = result ? result.balls.filter((ball) => ball.confidence < 0.7).length : 0
@@ -79,13 +74,24 @@ export default function App() {
     setResult(next)
     setConfirmed(false)
     setHistory(EMPTY_HISTORY)
+    setPicking(null)
     setStatus({ kind: 'idle' })
   }
 
   function onBallTap(index: number) {
     if (!result) return
-    const balls = applyTool(result.balls, index, tool)
-    if (balls === result.balls) return
+    if (tool === 'label') setPicking(index)
+    else commit(result.balls.filter((_, i) => i !== index))
+  }
+
+  function onPick(n: number) {
+    if (!result || picking == null) return
+    commit(setBall(result.balls, picking, n))
+    setPicking(null)
+  }
+
+  function commit(balls: Ball[]) {
+    if (!result || balls === result.balls) return
     setHistory({ past: [...history.past, result.balls], future: [] })
     setResult({ ...result, balls })
     setConfirmed(false)
@@ -210,13 +216,34 @@ export default function App() {
               />
             )}
 
-            <TableCanvas
-              data={result}
-              shots={shots.slice(0, 3)}
-              selected={selected}
-              showConfidence={!confirmed}
-              onBallTap={confirmed ? undefined : onBallTap}
-            />
+            {/* .table-stage goes full screen in phone landscape (see index.css) */}
+            <div
+              className="table-stage"
+              style={{ '--table-aspect': (result.table.width + RAIL * 2) / (result.table.height + RAIL * 2) } as React.CSSProperties}
+            >
+              <TableCanvas
+                data={result}
+                shots={shots.slice(0, 3)}
+                selected={selected}
+                showConfidence={!confirmed}
+                highlight={picking}
+                onBallTap={confirmed ? undefined : onBallTap}
+              />
+              {!confirmed && (
+                <div className="stage-tools">
+                  <EditToolbar
+                    vertical
+                    tool={tool}
+                    onToolChange={setTool}
+                    canUndo={history.past.length > 0}
+                    canRedo={history.future.length > 0}
+                    onUndo={undo}
+                    onRedo={redo}
+                    onConfirm={() => setConfirmed(true)}
+                  />
+                </div>
+              )}
+            </div>
 
             {!confirmed ? (
               <>
@@ -282,6 +309,10 @@ export default function App() {
           </section>
         )}
       </div>
+
+      {result && picking != null && result.balls[picking] && (
+        <BallPicker ball={result.balls[picking]} onPick={onPick} onClose={() => setPicking(null)} />
+      )}
     </main>
   )
 }

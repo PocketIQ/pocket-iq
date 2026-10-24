@@ -1,12 +1,7 @@
 import { useEffect, useRef } from 'react'
+import { BALL_COLORS } from './ballColors'
 import type { Shot, Vec } from './physics/shots'
 import type { AnalyzeResponse, Ball } from './types'
-
-// Standard pool ball colors, indexed by number (stripes reuse 1-7).
-const BALL_COLORS: Record<number, string> = {
-  1: '#f5c400', 2: '#1d4fd8', 3: '#d62828', 4: '#6b2fa3',
-  5: '#f77f00', 6: '#1f8a4c', 7: '#7a1f1f',
-}
 
 export const RAIL = 40 // table units of wood around the felt
 
@@ -88,12 +83,15 @@ export function TableCanvas({
   shots = [],
   selected = 0,
   showConfidence = true,
+  highlight = null,
   onBallTap,
 }: {
   data: AnalyzeResponse
   shots?: Shot[]
   selected?: number
   showConfidence?: boolean
+  /** Index of a ball to ring, e.g. the one the ball picker is open for. */
+  highlight?: number | null
   onBallTap?: (index: number) => void
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
@@ -209,12 +207,23 @@ export function TableCanvas({
           ctx.fillText(String(b.id), b.x, b.y + 0.5)
         }
       }
+
+      const marked = highlight == null ? null : data.balls[highlight]
+      if (marked) {
+        ctx.strokeStyle = '#34d399'
+        ctx.lineWidth = 4
+        ctx.beginPath()
+        ctx.arc(marked.x, marked.y, r + 7, 0, Math.PI * 2)
+        ctx.stroke()
+      }
     }
 
+    // Watch the canvas itself, not the window: rotating into landscape resizes it via CSS.
     draw()
-    window.addEventListener('resize', draw)
-    return () => window.removeEventListener('resize', draw)
-  }, [data, shots, selected, showConfidence])
+    const observer = new ResizeObserver(draw)
+    observer.observe(canvas)
+    return () => observer.disconnect()
+  }, [data, shots, selected, showConfidence, highlight])
 
   return (
     <canvas

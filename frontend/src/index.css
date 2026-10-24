@@ -2,3 +2,39 @@
 
 :root { color-scheme: light dark; }
 body { margin: 0; }
+
+/* Side toolbar only exists in the landscape full-screen view. */
+.stage-tools {
+  display: none;
+}
+
+/* Phone turned sideways: the table fills the screen, centered, nothing else showing. */
+@media (orientation: landscape) and (max-height: 500px) {
+  .table-stage {
+    --stage-h: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    background: #0a0a0a;
+    padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) env(safe-area-inset-bottom) max(8px, env(safe-area-inset-left));
+  }
+  /* As wide as possible without the height overflowing the screen; shrinks to make room for the toolbar. */
+  .table-stage > canvas {
+    flex: 0 1 auto;
+    min-width: 0;
+    width: min(100%, calc(var(--stage-h) * var(--table-aspect)));
+  }
+  .stage-tools {
+    display: flex;
+    flex: none;
+    max-height: var(--stage-h);
+    overflow-y: auto;
+  }
+  body:has(.table-stage) {
+    overflow: hidden;
+  }
+}
