@@ -42,9 +42,15 @@ create table if not exists shots (
     coached boolean not null,      -- they asked the coach first
     speed text,
     spin text,
-    photo int                      -- the photo that showed this shot's result
+    photo int,                     -- the photo that showed this shot's result
+    power real,                    -- coached strike: power 0-1, spin -1..1 (null if not coached)
+    spin_x real,
+    spin_y real
 );
 alter table shots add column if not exists photo int;
+alter table shots add column if not exists power real;
+alter table shots add column if not exists spin_x real;
+alter table shots add column if not exists spin_y real;
 create index if not exists shots_player_t on shots (player, t desc);
 """
 
@@ -132,12 +138,14 @@ def save_photo(state: dict, shot: dict | None, undone: dict | None = None) -> No
         intended = shot.get("intended") or {}
         statements.append((
             """insert into shots (game_id, player, target, pocket, kind, cut_angle, made,
-                                  pocketed, scratch, coached, speed, spin, photo)
-               values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                                  pocketed, scratch, coached, speed, spin, photo,
+                                  power, spin_x, spin_y)
+               values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (state["_id"], shot["player"].strip().lower(), intended.get("target"),
              intended.get("pocket"), intended.get("kind"), intended.get("cut_angle"),
              shot.get("made"), shot["pocketed"], shot["scratch"], bool(shot.get("coached")),
-             intended.get("speed"), intended.get("spin"), shot.get("photo"))))
+             intended.get("speed"), intended.get("spin"), shot.get("photo"),
+             intended.get("power"), intended.get("spin_x"), intended.get("spin_y"))))
     _run(*statements)
 
 

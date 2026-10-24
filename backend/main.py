@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator  # noqa:
 import ball_id  # noqa: E402
 import coach  # noqa: E402
 import game  # noqa: E402
+import physics  # noqa: E402
 import store  # noqa: E402
 import voice  # noqa: E402
 from vision import BALL_RADIUS, TABLE_H, TABLE_W, VisionError, analyze_image  # noqa: E402
@@ -134,6 +135,21 @@ class AdviceRequest(BaseModel):
     candidates: list[Candidate] = Field(max_length=12)
 
 
+class Spin(BaseModel):
+    x: float = Field(0.0, ge=-1, le=1)   # -1 left english .. 1 right english
+    y: float = Field(0.0, ge=-1, le=1)   # -1 full draw .. 1 full follow
+
+
+class SimulateRequest(BaseModel):
+    """A shot from the shot finder, struck with this power and spin."""
+    target_id: int = Field(ge=1, le=15)
+    pocket: str
+    kind: str = "direct"
+    cut_angle: float | None = None       # picks between banks off different cushions
+    power: float = Field(ge=0, le=1)
+    spin: Spin = Spin()
+
+
 @app.post("/games")
 def create_game(body: NewGame):
     state = game.new_game(body.players)
@@ -222,6 +238,29 @@ def advice(game_id: str, body: AdviceRequest):
         raise HTTPException(502, str(e))
     _save(state)   # keeps the suggestion, so the next photo's shot knows it was coached
     return result
+
+
+@app.post("/games/{game_id}/simulate")
+def simulate(game_id: str, body: SimulateRequest):
+    """
+    What happens if the current player hits this shot with this power and spin: does the
+    ball drop, where does the cue ball go and stop, does it scratch. For previewing the
+    spin indicator and power bar live. Uses the game's latest layout.
+    """
+    state = _load(game_id)
+    group = state["players"][state["turn"]]["group"]
+    balls = physics.balls_from_state(state)
+    if not any(b["type"] == "cue" for b in balls):
+        raise HTTPException(409, "The cue ball hasn't been seen yet. Take a photo of the table first.")
+    shot = physics.match_shot(balls, group, body.target_id, body.pocket, body.kind, body.cut_angle)
+    if shot is None:
+        raise HTTPException(409, "That shot isn't open from this layout.")
+    result = physics.simulate(balls, shot, body.power, (body.spin.x, body.spin.y))
+    return {
+        **physics.result_json(result),
+        "speed": physics.speed_word(body.power),
+        "spin_name": physics.spin_word((body.spin.x, body.spin.y)),
+    }
 
 
 @app.get("/games/{game_id}/advice/audio")

@@ -121,14 +121,63 @@ Response:
 ```json
 {"shot_index": 0, "target_ball": 3, "pocket": "top_left",
  "aim": "Aim at the left edge of the 3", "speed": "medium", "spin": "draw",
- "cue_ball_after": "Draw back to the middle for the 5", "why": "...", "tip": "..."}
+ "cue_ball_after": "Draw back to the middle for the 5", "why": "...", "tip": "...",
+ "physics": {
+   "planned": true,
+   "power": 0.34,
+   "spin": {"x": 0.0, "y": -0.5},
+   "cue_path": [{"x": 250, "y": 250}, {"x": 412, "y": 260}, {"x": 380, "y": 310}],
+   "cue_stop": {"x": 300, "y": 330},
+   "object_path": [{"x": 434, "y": 262}, {"x": 0, "y": 0}],
+   "scratch": false,
+   "next_shot": {"target_ball": 5, "pocket": "bottom_left", "cut_angle": 14}
+ }}
 ```
 - `shot_index` -1 = no good shot: play the safety described in `aim`
 - `speed`: `"soft" | "medium" | "firm" | "hard"`;
-  `spin`: `"center" | "follow" | "draw" | "stop" | "left english" | "right english"`
+  `spin`: `"center" | "follow" | "draw" | "stop" | "left english" | "right english"`.
+  With a physics plan, these words are derived from `physics.power` / `physics.spin`,
+  so they always match the indicator.
 - Gemini picks and explains; `target_ball`/`pocket` always come from the chosen candidate
+- `physics` (null for a safety, or if the cue ball's position is unknown): numbers for
+  the spin indicator and power bar, from `backend/physics.py`. See "Spin and power" below.
 - the player's stats (below) are in the prompt, so advice fits how they actually shoot
 - 502 if Gemini isn't reachable or configured
+
+`POST /games/{id}/simulate` → what happens if the current player hits a shot with a given
+power and spin, from the latest layout. For moving the spin dot / power bar and showing
+the result live (it's fast: a few ms).
+```json
+{"target_id": 3, "pocket": "top_left", "kind": "direct", "cut_angle": 12,
+ "power": 0.45, "spin": {"x": 0.0, "y": 0.6}}
+```
+Response: the `physics` object above, minus `next_shot`, plus:
+```json
+{"planned": false, "made": true, "kissed": false, "speed": "firm", "spin_name": "follow", "...": "..."}
+```
+- `made`: the object ball drops in that pocket; `scratch`: the cue ball drops;
+  `kissed`: the cue ball runs into another ball after contact (its path stops there)
+- `target_id`/`pocket`/`kind`/`cut_angle`: a shot from the shot finder (the same fields as
+  an advice candidate). 409 if that shot isn't open from this layout, or the cue ball
+  hasn't been seen
+
+### Spin and power
+How the numbers map to the indicator (same in advice `physics` and `/simulate`):
+- `power`: 0 (barely moving) to 1 (a hard break, 8 m/s). Typical shots: 0.1–0.5.
+  Words: < 0.2 soft, < 0.4 medium, < 0.65 firm, else hard.
+- `spin.x`: where the cue tip hits, left (-1) to right (+1) of center: english.
+- `spin.y`: below (-1, draw) to above (+1, follow) center.
+- `1` = the tip half a ball-radius off center (about as far as is safe without
+  miscueing). Draw it as a dot on a cue-ball circle at `(x, -y) * 0.5 * radius` from the
+  center (screen y grows down, so follow is up).
+- `cue_path`: the cue ball from where it starts, to contact, then after contact until it
+  stops (table units, for drawing). `object_path`: the object ball to the pocket.
+- `planned`: true = the backend searched power and spin for the best position play;
+  false = a simulation of the coach's words, or of what was sent to `/simulate`.
+
+The model: sliding then rolling friction, ball-ball and cushion collisions, follow/draw
+bending the cue ball's path, english changing cushion rebounds. Good enough to pick
+follow vs draw and soft vs firm; not to the inch (no squirt, swerve, throw).
 
 `GET /games/{id}/advice/audio` → `audio/mpeg`: the latest advice read aloud (ElevenLabs).
 409 if the coach hasn't been asked this turn; 502 if ElevenLabs fails.
