@@ -367,11 +367,16 @@ export default function App() {
     else saveGutter(game.gutter.filter(e => e.ball !== ball))
   }
 
+  // A ball from the gutter goes back on the table (saved); a loose one is a layout edit.
   function placeBall(x: number, y: number) {
-    if (!game || placing == null) return
-    const ball: Ball = { id: placing, type: ballType(placing), x, y, confidence: 1 }
+    if (!game || !view || placing == null) return
+    const ball: Ball =
+      placing === 0
+        ? { id: null, type: 'cue', x, y, confidence: 1 }
+        : { id: placing, type: ballType(placing), x, y, confidence: 1 }
     setPlacing(null)
-    saveGutter(game.gutter.filter(e => e.ball !== ball.id), { on: ball })
+    if (game.gutter.some(e => e.ball === placing)) saveGutter(game.gutter.filter(e => e.ball !== placing), { on: ball })
+    else commit(changeTable(view.balls, { on: ball }))
   }
 
   // Every photo after the first shows the result of the shot before it: the backend
@@ -445,6 +450,10 @@ export default function App() {
       setStatus({ kind: 'error', message: 'Every ball needs a number before confirming. Tap it with Set ball.' })
       return
     }
+    if (loose.length) {
+      setStatus({ kind: 'error', message: 'Every ball has to be on the table or in the gutter. Tap the ones marked ? to say where.' })
+      return
+    }
     let current = view
     let currentGame = game
     if (!devMode && view.balls !== serverBalls) {
@@ -494,17 +503,24 @@ export default function App() {
   const sunk = new Set(
     Object.entries(game?.balls ?? {}).filter(([b, s]) => s === 'sunk' && b !== 'cue').map(([b]) => Number(b)),
   )
+  // Every ball is on the table or in the gutter; these are neither (0 = the cue ball).
+  const onTable = new Set(view?.balls.map(b => (b.type === 'cue' ? 0 : b.id)) ?? [])
+  const loose = view ? Array.from({ length: 16 }, (_, n) => n).filter(n => !onTable.has(n) && !sunk.has(n)) : []
 
-  const gutterPanel = game && (
-    <Gutter
-      game={game}
-      rosters={rosters}
-      balls={gutter}
-      onSetWho={setWho}
-      onRemove={removeFromGutter}
-      onAdd={addToGutter}
-    />
-  )
+  const gutterPanel = (compact = false) =>
+    game && (
+      <Gutter
+        game={game}
+        rosters={rosters}
+        balls={gutter}
+        loose={loose}
+        compact={compact}
+        onSetWho={setWho}
+        onRemove={removeFromGutter}
+        onAdd={addToGutter}
+        onPlace={setPlacing}
+      />
+    )
 
   return (
     <main className="min-h-dvh bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
@@ -578,7 +594,7 @@ export default function App() {
             )}
 
             {/* No table to show yet (or the game's over): the gutter goes where it would be */}
-            {!(view && game.winner == null) && gutterPanel}
+            {!(view && game.winner == null) && gutterPanel()}
 
             {view && game.winner == null && (
               <section className="flex flex-col gap-2">
@@ -604,19 +620,22 @@ export default function App() {
                   className="table-stage relative"
                   style={{ '--table-aspect': (view.table.width + RAIL * 2) / (view.table.height + RAIL * 2) } as React.CSSProperties}
                 >
-                  <TableCanvas
-                    data={view}
-                    shots={shown.map(i => shots[i])}
-                    selected={shown.indexOf(selected)}
-                    showConfidence={!confirmed}
-                    highlight={picking}
-                    onBallTap={confirmed ? undefined : onBallTap}
-                    onTableTap={placing == null ? undefined : placeBall}
-                  />
+                  <div className="stage-main">
+                    <TableCanvas
+                      data={view}
+                      shots={shown.map(i => shots[i])}
+                      selected={shown.indexOf(selected)}
+                      showConfidence={!confirmed}
+                      highlight={picking}
+                      onBallTap={confirmed ? undefined : onBallTap}
+                      onTableTap={placing == null ? undefined : placeBall}
+                    />
+                    <div className="stage-gutter">{gutterPanel(true)}</div>
+                  </div>
                   {placing != null && (
                     <div className="absolute inset-x-0 top-2 z-10 flex justify-center px-2">
                       <p role="status" className="flex items-center gap-3 rounded-full bg-stone-950/85 py-1.5 pr-1.5 pl-4 text-sm font-semibold text-white shadow-lg">
-                        Tap where the {placing} is
+                        Tap where the {placing === 0 ? 'cue ball' : placing} is
                         <button
                           type="button"
                           onClick={() => setPlacing(null)}
@@ -643,7 +662,7 @@ export default function App() {
                   )}
                 </div>
 
-                {gutterPanel}
+                {gutterPanel()}
 
                 {!confirmed ? (
                   <>

@@ -7,7 +7,7 @@ import type { Game } from './types'
 export type Rosters = [string[], string[]] | null
 
 /** Ring color for each side, used on the scoreboard and around pocketed balls. */
-export const SIDE_COLORS = ['#38bdf8', '#f472b6'] as const
+export const SIDE_COLORS = ['#38bdf8', '#fb923c'] as const
 
 const rosterKey = (gameId: string) => `cueiq.teams.${gameId}`
 

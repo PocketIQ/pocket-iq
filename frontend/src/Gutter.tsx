@@ -29,19 +29,21 @@ function Chip({ active, color, onClick, children }: {
   )
 }
 
-function GutterSlot({ entry, onClick }: { entry: GutterBall; onClick: () => void }) {
+const ballName = (n: number) => (n === 0 ? 'cue ball' : `${n}`)
+
+function GutterSlot({ entry, compact, onClick }: { entry: GutterBall; compact: boolean; onClick: () => void }) {
   const color = entry.side == null ? null : SIDE_COLORS[entry.side]
   return (
     <button
       type="button"
       onClick={onClick}
       aria-label={`Ball ${entry.ball}${entry.member ? `, ${entry.member}` : ''}${entry.wrong ? ', opponent’s ball' : ''}. Edit`}
-      className="relative flex size-10 shrink-0 items-center justify-center rounded-full"
+      className={`relative flex shrink-0 items-center justify-center rounded-full ${compact ? 'size-7' : 'size-10'}`}
     >
-      <BallIcon n={entry.ball} className="size-8" />
+      <BallIcon n={entry.ball} className={compact ? 'size-5' : 'size-8'} />
       {color && (
         <span
-          className={`absolute inset-0 rounded-full border-[3px] ${entry.wrong ? 'border-dashed' : ''}`}
+          className={`absolute inset-0 rounded-full ${compact ? 'border-2' : 'border-[3px]'} ${entry.wrong ? 'border-dashed' : ''}`}
           style={{ borderColor: color }}
           aria-hidden="true"
         />
@@ -49,7 +51,9 @@ function GutterSlot({ entry, onClick }: { entry: GutterBall; onClick: () => void
       {/* Team mode: the teammate who pocketed it */}
       {color && entry.member && (
         <span
-          className="absolute -right-1 -bottom-1 flex size-4 items-center justify-center rounded-full text-[9px] font-bold text-stone-950 ring-2 ring-stone-900"
+          className={`absolute -right-1 -bottom-1 flex items-center justify-center rounded-full font-bold text-stone-950 ring-2 ring-stone-900 ${
+            compact ? 'size-3 text-[7px]' : 'size-4 text-[9px]'
+          }`}
           style={{ background: color }}
           aria-hidden="true"
         >
@@ -61,19 +65,26 @@ function GutterSlot({ entry, onClick }: { entry: GutterBall; onClick: () => void
 }
 
 /**
- * The pocketed balls, in order, in a ball-return gutter. Tap one to fix detection mistakes:
- * who it counts for, or that it isn't pocketed at all. + adds one that was missed.
+ * The pocketed balls in a ball-return gutter, newest first. Tap one to fix detection
+ * mistakes: who it counts for, or that it isn't pocketed at all. + adds one that was missed.
+ * `loose`: balls that are neither on the table nor in the gutter (missed by the camera, or
+ * removed by hand), shown next to + until the player says where they are.
+ * `compact`: the thin strip under the table in full screen.
  */
-export function Gutter({ game, rosters, balls, onSetWho, onRemove, onAdd }: {
+export function Gutter({ game, rosters, balls, loose, compact = false, onSetWho, onRemove, onAdd, onPlace }: {
   game: Game
   rosters: Rosters
   balls: GutterBall[]
+  loose: number[]
+  compact?: boolean
   onSetWho: (ball: number, side: 0 | 1 | null, member: string | null) => void
   onRemove: (ball: number) => void // back on the table
   onAdd: (ball: number) => void // off the table
+  onPlace: (ball: number) => void // a loose ball: put it on the table
 }) {
   const [editing, setEditing] = useState<number | null>(null)
   const [adding, setAdding] = useState(false)
+  const [locating, setLocating] = useState<number | null>(null) // a loose ball: where is it?
   const entry = balls.find(g => g.ball === editing)
 
   function remove(ball: number) {
@@ -91,21 +102,58 @@ export function Gutter({ game, rosters, balls, onSetWho, onRemove, onAdd }: {
 
   return (
     <section aria-label="Pocketed balls" className="flex flex-col gap-1.5">
-      <div className="flex items-center gap-1 overflow-x-auto rounded-full border border-stone-700 bg-gradient-to-b from-stone-950 to-stone-800 px-2 py-1.5 shadow-[inset_0_3px_8px_rgba(0,0,0,0.75)]">
-        {balls.length === 0 && <span className="px-2 text-xs text-stone-400">No balls pocketed yet</span>}
-        {balls.map(g => (
-          <GutterSlot key={g.ball} entry={g} onClick={() => setEditing(g.ball)} />
-        ))}
+      <div
+        className={`flex items-center overflow-x-auto rounded-full border border-stone-700 bg-stone-900 ${
+          compact ? 'gap-0.5 px-1 py-0.5' : 'gap-1 px-2 py-1.5'
+        }`}
+      >
         <button
           type="button"
           aria-label="Add a pocketed ball"
           onClick={() => setAdding(true)}
-          className="ml-auto flex size-10 shrink-0 items-center justify-center rounded-full border-2 border-dashed border-stone-600 text-xl text-stone-400 active:bg-stone-800"
+          className={`flex shrink-0 items-center justify-center rounded-full border-2 border-dashed border-stone-600 text-stone-400 active:bg-stone-800 ${
+            compact ? 'size-7 text-base' : 'size-10 text-xl'
+          }`}
         >
           +
         </button>
+        {loose.map(n => (
+          // Not on the table and not in the gutter: tap to say where it is
+          <button
+            key={`loose-${n}`}
+            type="button"
+            aria-label={`Where is the ${ballName(n)}?`}
+            onClick={() => setLocating(n)}
+            className={`relative flex shrink-0 items-center justify-center rounded-full border-2 border-dashed border-amber-400 ${
+              compact ? 'size-7' : 'size-10'
+            }`}
+          >
+            <BallIcon n={n} className={`opacity-60 ${compact ? 'size-5' : 'size-8'}`} />
+            <span
+              className={`absolute -top-1 -right-1 flex items-center justify-center rounded-full bg-amber-400 font-bold text-stone-950 ${
+                compact ? 'size-3 text-[8px]' : 'size-4 text-[10px]'
+              }`}
+              aria-hidden="true"
+            >
+              ?
+            </span>
+          </button>
+        ))}
+        {loose.length > 0 && balls.length > 0 && <span className="mx-1 h-6 w-px shrink-0 bg-stone-700" aria-hidden="true" />}
+        {balls.length === 0 && loose.length === 0 && (
+          <span className="px-2 text-xs text-stone-400">No balls pocketed yet</span>
+        )}
+        {[...balls].reverse().map(g => (
+          <GutterSlot key={g.ball} entry={g} compact={compact} onClick={() => setEditing(g.ball)} />
+        ))}
       </div>
-      <p className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-xs text-stone-500">
+      {!compact && loose.length > 0 && (
+        <p className="px-1 text-xs font-semibold text-amber-700 dark:text-amber-300">
+          Where {loose.length === 1 ? 'is' : 'are'} the {loose.map(ballName).join(', ')}? Tap to put{' '}
+          {loose.length === 1 ? 'it' : 'each'} on the table or in the gutter.
+        </p>
+      )}
+      {!compact && <p className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-xs text-stone-500">
         {game.players.map((p, i) => (
           <span key={p.name} className="flex items-center gap-1">
             <span className="size-2.5 rounded-full" style={{ background: SIDE_COLORS[i] }} aria-hidden="true" />
@@ -113,7 +161,43 @@ export function Gutter({ game, rosters, balls, onSetWho, onRemove, onAdd }: {
           </span>
         ))}
         <span>dashed = opponent’s ball · no ring = break</span>
-      </p>
+      </p>}
+
+      {locating != null && (
+        <Sheet title={`Where’s the ${ballName(locating)}?`} onClose={() => setLocating(null)}>
+          <div className="flex flex-col gap-2 pb-1">
+            <div className="flex justify-center">
+              <BallIcon n={locating} className="size-14" />
+            </div>
+            <p className="text-sm text-stone-600 dark:text-stone-400">
+              It isn’t on the table or in the gutter. Every ball has to be one or the other.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                onPlace(locating)
+                setLocating(null)
+              }}
+              className="min-h-11 rounded-xl bg-emerald-700 px-4 py-3 font-semibold text-white active:bg-emerald-800"
+            >
+              On the table: tap where it is
+            </button>
+            {/* The cue ball never stays down: after a scratch it comes back out */}
+            {locating !== 0 && (
+              <button
+                type="button"
+                onClick={() => {
+                  add(locating)
+                  setLocating(null)
+                }}
+                className="min-h-11 rounded-xl bg-stone-200 px-4 py-3 font-semibold active:bg-stone-300 dark:bg-stone-800 dark:active:bg-stone-700"
+              >
+                It was pocketed
+              </button>
+            )}
+          </div>
+        </Sheet>
+      )}
 
       {entry && (
         <Sheet title={`Ball ${entry.ball}`} onClose={() => setEditing(null)}>

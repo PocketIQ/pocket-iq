@@ -170,6 +170,26 @@ export function TableCanvas({
       ctx.fillStyle = '#17643f'
       ctx.fillRect(0, 0, TW, TH)
 
+      // Diamonds: 3 evenly spaced sights between each pair of pockets, along the middle of the rails
+      const mid = RAIL / 2
+      const sights: [number, number, boolean][] = [] // x, y, on a long rail
+      for (const k of [1, 2, 3, 5, 6, 7]) sights.push([(TW * k) / 8, -mid, true], [(TW * k) / 8, TH + mid, true])
+      for (const k of [1, 2, 3]) sights.push([-mid, (TH * k) / 4, false], [TW + mid, (TH * k) / 4, false])
+      ctx.fillStyle = '#d6d9de'
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)'
+      ctx.lineWidth = 1
+      for (const [x, y, long] of sights) {
+        const [w, h] = long ? [9, 5] : [5, 9] // half-sizes, longer along the rail
+        ctx.beginPath()
+        ctx.moveTo(x - w, y)
+        ctx.lineTo(x, y - h)
+        ctx.lineTo(x + w, y)
+        ctx.lineTo(x, y + h)
+        ctx.closePath()
+        ctx.fill()
+        ctx.stroke()
+      }
+
       // Pockets: 4 corners + 2 side
       ctx.fillStyle = '#0a0a0a'
       for (const [px, py] of [[0, 0], [TW / 2, 0], [TW, 0], [0, TH], [TW / 2, TH], [TW, TH]]) {

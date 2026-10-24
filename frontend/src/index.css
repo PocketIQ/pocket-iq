@@ -3,8 +3,9 @@
 :root { color-scheme: light dark; }
 body { margin: 0; }
 
-/* Side toolbar only exists in the landscape full-screen view. */
-.stage-tools {
+/* Side toolbar and the thin gutter only exist in the landscape full-screen view. */
+.stage-tools,
+.stage-gutter {
   display: none;
 }
 
@@ -22,11 +23,19 @@ body { margin: 0; }
     background: #0a0a0a;
     padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-right)) env(safe-area-inset-bottom) max(8px, env(safe-area-inset-left));
   }
-  /* As wide as possible without the height overflowing the screen; shrinks to make room for the toolbar. */
-  .table-stage > canvas {
+  /* Table + thin gutter under it: as wide as possible without the height overflowing the
+     screen; shrinks to make room for the toolbar. */
+  .stage-main {
+    --gutter-h: 48px; /* the compact gutter, the gap above it, and a little room below */
     flex: 0 1 auto;
     min-width: 0;
-    width: min(100%, calc(var(--stage-h) * var(--table-aspect)));
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: min(100%, calc((var(--stage-h) - var(--gutter-h)) * var(--table-aspect)));
+  }
+  .stage-gutter {
+    display: block;
   }
   .stage-tools {
     display: flex;
