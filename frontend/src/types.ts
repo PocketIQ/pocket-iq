@@ -13,5 +13,10 @@ export interface AnalyzeResponse {
   table: { width: number; height: number }
   ball_radius: number
   balls: Ball[]
-  debug?: { received_bytes: number; image_size: [number, number] }
+  debug?: {
+    received_bytes: number
+    image_size: [number, number]
+    markers_used?: number[]
+    markers_rejected?: number[]
+  }
 }

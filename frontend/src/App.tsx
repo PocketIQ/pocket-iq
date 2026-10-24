@@ -37,7 +37,8 @@ export default function App() {
         <header>
           <h1 className="text-2xl font-bold">CueIQ</h1>
           <p className="text-sm text-stone-600 dark:text-stone-400">
-            Snap the table with all four corner markers in frame.
+            Tape a marker at each corner (and the side pockets if you have them), then snap
+            the table with at least four markers in frame.
           </p>
         </header>
 
@@ -65,8 +66,10 @@ export default function App() {
             <TableCanvas data={result} />
             <p className="text-xs text-stone-500">
               {result.balls.length} balls · dashed ring = low confidence
+              {result.debug?.markers_used &&
+                ` · markers ${result.debug.markers_used.join(', ')}`}
               {result.debug &&
-                ` · server got ${(result.debug.received_bytes / 1024).toFixed(0)} KB, ${result.debug.image_size.join('×')}`}
+                ` · ${result.debug.image_size.join('×')}`}
             </p>
           </section>
         )}
