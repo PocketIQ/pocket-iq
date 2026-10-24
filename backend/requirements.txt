@@ -22,3 +22,6 @@ pyjwt[crypto]           # verifies Auth0 login tokens sent from the frontend
 
 # --- Config ---
 python-dotenv           # loads API keys from a .env file so they never get committed
+
+# --- Tools ---
+pillow                  # only for tools/make_markers.py (printable PDF)

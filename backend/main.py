@@ -1,23 +1,19 @@
-"""
-CueIQ backend — upload a table photo, detect corner markers, return balls in table space.
-"""
+"""CueIQ backend. POST /analyze: photo in, balls JSON out (see CONTRACT.md)."""
 import os
 
-import cv2
-import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 
-from vision import BALL_RADIUS, TABLE_H, TABLE_W, VisionError, analyze_image
+load_dotenv()  # reads backend/.env into os.environ
 
-load_dotenv()
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+from fastapi import FastAPI, File, HTTPException, UploadFile  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+from vision import BALL_RADIUS, TABLE_H, TABLE_W, VisionError, analyze_image  # noqa: E402
 
 app = FastAPI(title="CueIQ API")
 
-# The browser blocks calls to a different domain unless the server allows it.
-# Locally the frontend runs on :5173; in production add your Vercel URL
-# via the FRONTEND_ORIGINS env var (comma-separated).
 origins = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -45,17 +41,11 @@ async def analyze(photo: UploadFile = File(...)):
     try:
         result = analyze_image(img)
     except VisionError as e:
-        raise HTTPException(400, str(e)) from e
+        # 422 = "I understood the request but can't use this photo". Frontend shows the message.
+        raise HTTPException(422, str(e))
 
-    h, w = img.shape[:2]
     return {
         "table": {"width": TABLE_W, "height": TABLE_H},
         "ball_radius": BALL_RADIUS,
         "balls": result.balls,
-        "debug": {
-            "received_bytes": len(data),
-            "image_size": [w, h],
-            "markers_used": result.markers_used,
-            "markers_rejected": result.markers_rejected,
-        },
     }
