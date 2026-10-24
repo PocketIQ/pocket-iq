@@ -7,7 +7,7 @@ uvicorn[standard]       # runs the FastAPI app
 python-multipart        # lets FastAPI receive uploaded photos
 
 # --- Computer vision ---
-opencv-contrib-python-headless   # OpenCV + the ArUco marker module ("headless" = no GUI, works on servers)
+opencv-python-headless           # OpenCV ("headless" = no GUI, works on servers)
 numpy                            # array math OpenCV is built on
 
 # --- AI ---
@@ -22,6 +22,3 @@ pyjwt[crypto]           # verifies Auth0 login tokens sent from the frontend
 
 # --- Config ---
 python-dotenv           # loads API keys from a .env file so they never get committed
-
-# --- Tools ---
-pillow                  # only for tools/make_markers.py (printable PDF)

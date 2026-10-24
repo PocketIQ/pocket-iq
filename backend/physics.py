@@ -51,7 +51,9 @@ STOPPED = 2.0
 
 # ===================================================== geometry (port of shots.ts)
 # Same rules as frontend/src/physics/shots.ts: ghost-ball aiming, one-cushion banks,
-# clear-path checks. Keep the two in sync.
+# clear-path checks. One difference: balls are aimed at each pocket's mouth (the middle
+# of its opening, Pocket.mouth), not its corner point, so the cut angles here can differ
+# from the frontend's by a degree or two. match_shot pairs them up by target and pocket.
 
 @dataclass
 class Pocket:
@@ -59,6 +61,30 @@ class Pocket:
     x: float
     y: float
     side: bool
+
+    @property
+    def mouth(self) -> tuple:
+        """Where to send a ball: the middle of the pocket's opening, for a ball's center.
+        Not the pocket's corner point: a ball near a rail aimed at the corner would have
+        to cross the cushion first, while one aimed here reaches the opening clear of it
+        (and drops), the way a ball rolled along the rail goes in."""
+        if self.side:
+            return (self.x, self.y + (R if self.y == 0 else -R) * 0.5)
+        c = (CORNER_MOUTH + R) / 2                  # halfway across the jaws
+        return (c if self.x == 0 else self.x - c, c if self.y == 0 else self.y - c)
+
+    def aims(self) -> list[tuple[tuple, float]]:
+        """Points across the opening to aim through, middle first, each with how far off
+        the middle it is (0-1). A real player favors one side of the pocket when the middle
+        is blocked or can't be reached (a ball frozen on the rail)."""
+        if self.side:
+            mx, my = self.mouth
+            return [((mx + f * SIDE_MOUTH, my), abs(f) / 0.5) for f in (0.0, -0.25, 0.25, -0.5, 0.5)]
+        sx, sy = (1 if self.x == 0 else -1), (1 if self.y == 0 else -1)
+        a = (self.x + sx * CORNER_MOUTH, self.y + sy * R)       # the jaw along the x rail
+        b = (self.x + sx * R, self.y + sy * CORNER_MOUTH)       # the jaw along the y rail
+        return [((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])), abs(t - 0.5) / 0.35)
+                for t in (0.5, 0.3, 0.7, 0.15, 0.85)]
 
 
 def pockets(W: float = TABLE_W, H: float = TABLE_H) -> list[Pocket]:
@@ -111,6 +137,27 @@ def _cross_x(a, b, X):
     return (X, a[1] + t * (b[1] - a[1]))
 
 
+def _passes_pocket(a, b, aiming_for: "Pocket", W: float = TABLE_W, H: float = TABLE_H) -> bool:
+    """Does a ball rolling a -> b pass over another pocket on the way (a ball run down
+    the rail past the side pocket drops in the side)?"""
+    for pk in pockets(W, H):
+        if pk.name != aiming_for.name:
+            reach = SIDE_CAPTURE if pk.side else CORNER_CAPTURE
+            if dist_to_segment((pk.x, pk.y), a, b) < reach:
+                return True
+    return False
+
+
+def _bank_in_pocket(bank, W: float = TABLE_W, H: float = TABLE_H) -> bool:
+    """Would a bank off this cushion point land in a pocket's opening (plus a ball's
+    width of the jaw)? There's no cushion there: the ball drops instead of banking."""
+    on_long_rail = abs(bank[1] - R) < 1 or abs(bank[1] - (H - R)) < 1
+    along, length = (bank[0], W) if on_long_rail else (bank[1], H)
+    if along < CORNER_MOUTH + R or along > length - CORNER_MOUTH - R:
+        return True
+    return on_long_rail and abs(along - W / 2) < SIDE_MOUTH + R
+
+
 def legal_targets(balls: list[dict], group: str | None) -> list[int]:
     idx = range(len(balls))
     if group is None:
@@ -144,38 +191,41 @@ def find_shots(balls: list[dict], group: str | None, *, cue: tuple | None = None
     diag = math.hypot(W, H)
     shots: list[Shot] = []
 
-    def try_shot(ti, target, pocket, aim_at, bank):
+    def try_shot(ti, target, pocket, aim_at, bank, drop, off) -> bool:
+        """drop: the point in the pocket's opening the ball goes through; aim_at: where
+        the object ball is sent first (drop, or its mirror image for a bank)."""
         ghost = _sub(target, _mul(_unit(_sub(aim_at, target)), 2 * R))
         if not (R <= ghost[0] <= W - R and R <= ghost[1] <= H - R):
-            return
+            return False
         cut = _cut_deg(cue, ghost, target, aim_at)
         if cut > 75:
-            return
-        final_leg = _sub((pocket.x, pocket.y), bank or target)
+            return False
+        final_leg = _sub(drop, bank or target)
         if pocket.side and abs(_unit(final_leg)[1]) < 0.5:
-            return
+            return False
         skip = {ti} | ({cue_i} if cue_i is not None else set())
         if not _clear(cue, ghost, balls, skip):
-            return
-        if bank:
-            if not (_clear(target, bank, balls, skip) and _clear(bank, (pocket.x, pocket.y), balls, skip)):
-                return
-        elif not _clear(target, (pocket.x, pocket.y), balls, skip):
-            return
-        travel = _len(_sub(ghost, cue)) + (_len(_sub(bank, target)) + _len(_sub((pocket.x, pocket.y), bank))
-                                           if bank else _len(_sub((pocket.x, pocket.y), target)))
+            return False
+        legs = [(target, bank), (bank, drop)] if bank else [(target, drop)]
+        if not all(_clear(a, b, balls, skip) for a, b in legs):
+            return False
+        if any(_passes_pocket(a, b, pocket, W, H) for a, b in legs):
+            return False
+        travel = _len(_sub(ghost, cue)) + sum(_len(_sub(b, a)) for a, b in legs)
         difficulty = (0.55 * (cut / 75) ** 1.5 + 0.3 * travel / diag
-                      + (0.25 if bank else 0) + (0.05 if pocket.side else 0))
+                      + (0.25 if bank else 0) + (0.05 if pocket.side else 0) + 0.08 * off)
         shots.append(Shot(ti, balls[ti]["id"], pocket, "bank" if bank else "direct",
                           ghost, aim_at, bank, cut, difficulty))
+        return True
 
     for ti in legal_targets(balls, group):
         target = (balls[ti]["x"], balls[ti]["y"])
         for p in pockets(W, H):
-            pp = (p.x, p.y)
-            try_shot(ti, target, p, pp, None)
+            # Through the middle of the opening if that works, else off to one side.
+            any(try_shot(ti, target, p, drop, None, drop, off) for drop, off in p.aims())
             if not banks:
                 continue
+            pp = p.mouth
             cushions = [
                 (lambda q: (q[0], 2 * R - q[1]), lambda a, b: _cross_y(a, b, R)),
                 (lambda q: (q[0], 2 * (H - R) - q[1]), lambda a, b: _cross_y(a, b, H - R)),
@@ -189,7 +239,9 @@ def find_shots(balls: list[dict], group: str | None, *, cue: tuple | None = None
                 bank = hit(target, m)
                 if not bank or not (R <= bank[0] <= W - R and R <= bank[1] <= H - R):
                     continue
-                try_shot(ti, target, p, m, bank)
+                if _bank_in_pocket(bank, W, H):
+                    continue
+                try_shot(ti, target, p, m, bank, pp, 0.0)
     return sorted(shots, key=lambda s: s.difficulty)
 
 
@@ -452,6 +504,75 @@ def plan(balls: list[dict], shot: Shot, group: str | None) -> Plan | None:
     return best
 
 
+# ================================================================ ball in hand
+# After a scratch the next player can put the cue ball anywhere. Try spots behind each
+# open shot (straight in, and a little to either side for position), keep the easiest
+# shots, then let the planner pick power and spin and score where the cue ball ends up.
+HAND_DISTANCES = (3 * R, 7 * R, 14 * R)       # cue ball to ghost ball
+HAND_ANGLES = (0.0, -15.0, 15.0, -30.0, 30.0)  # cut angle to set up, degrees
+HAND_PLAN_TOP = 8                              # how many of the easiest spots get a full plan
+
+
+@dataclass
+class HandPlan:
+    cue: tuple                       # where to put the cue ball
+    shot: Shot
+    plan: Plan
+    score: float                     # lower is better
+
+
+def ball_in_hand(balls: list[dict], group: str | None) -> HandPlan | None:
+    """Best place for the cue ball, and the shot and plan from there. `balls` may include
+    the cue ball (it's ignored: it's in hand). None if no spot gives a shot."""
+    options = ball_in_hand_options(balls, group, 1)
+    return options[0] if options else None
+
+
+def ball_in_hand_options(balls: list[dict], group: str | None, k: int = 3) -> list[HandPlan]:
+    """The k best cue ball spots, each for a different ball or pocket, best first."""
+    others = [b for b in balls if b["type"] != "cue"]
+    candidates: dict[tuple, tuple] = {}            # (target, pocket) -> (difficulty, cue, shot)
+    for ti in legal_targets(others, group):
+        t = (others[ti]["x"], others[ti]["y"])
+        for p in pockets():
+            d = _unit(_sub(p.mouth, t))
+            ghost = _sub(t, _mul(d, 2 * R))
+            for ang in HAND_ANGLES:
+                a = math.radians(ang)
+                back = (d[0] * math.cos(a) - d[1] * math.sin(a), d[0] * math.sin(a) + d[1] * math.cos(a))
+                for dist in HAND_DISTANCES:
+                    cue = _sub(ghost, _mul(back, dist))
+                    if not (R + 1 <= cue[0] <= TABLE_W - R - 1 and R + 1 <= cue[1] <= TABLE_H - R - 1):
+                        continue
+                    if any(math.hypot(cue[0] - o["x"], cue[1] - o["y"]) < 2 * R + 1 for o in others):
+                        continue
+                    if _capture(cue):                  # not on a pocket
+                        continue
+                    layout = [*others, {"id": None, "type": "cue", "x": cue[0], "y": cue[1]}]
+                    shot = next((s for s in find_shots(layout, group, banks=False)
+                                 if s.target_index == ti and s.pocket.name == p.name), None)
+                    if shot is None:
+                        continue
+                    key = (ti, p.name)
+                    if key not in candidates or shot.difficulty < candidates[key][0]:
+                        candidates[key] = (shot.difficulty, cue, shot, layout)
+    planned = []
+    for difficulty, cue, shot, layout in sorted(candidates.values(), key=lambda c: c[0])[:HAND_PLAN_TOP]:
+        pl = plan(layout, shot, group)
+        if pl is not None:
+            planned.append(HandPlan(cue, shot, pl, difficulty + pl.score))
+    return sorted(planned, key=lambda h: h.score)[:k]
+
+
+def hand_json(h: HandPlan) -> dict:
+    return {
+        "cue": {"x": round(h.cue[0], 1), "y": round(h.cue[1], 1)},
+        "target_ball": h.shot.target_id, "pocket": h.shot.pocket.name, "kind": h.shot.kind,
+        "cut_angle": round(h.shot.cut), "physics": plan_json(h.plan),
+        "speed": speed_word(h.plan.power), "spin_name": spin_word(h.plan.spin),
+    }
+
+
 # ================================================================ words for the coach
 def speed_word(power: float) -> str:
     return "soft" if power < 0.2 else "medium" if power < 0.4 else "firm" if power < 0.65 else "hard"
@@ -509,9 +630,12 @@ def result_json(r: Result) -> dict:
 
 # ================================================================ game state glue
 def balls_from_state(state: dict) -> list[dict]:
-    """Balls still in play with a known position, in the shape find_shots expects."""
+    """Balls still in play with a known position, in the shape find_shots expects. With
+    ball in hand the cue ball's last spot means nothing, so it's left out."""
     out = []
     for b, v in state["balls"].items():
+        if b == "cue" and state.get("ball_in_hand"):
+            continue
         if v["status"] == "on" and v["x"] is not None:
             t = "cue" if b == "cue" else "eight" if b == "8" else "solid" if int(b) < 8 else "stripe"
             out.append({"id": None if b == "cue" else int(b), "type": t, "x": v["x"], "y": v["y"]})
