@@ -611,6 +611,7 @@ export default function App() {
                     showConfidence={!confirmed}
                     highlight={picking}
                     onBallTap={confirmed ? undefined : onBallTap}
+                    onShotTap={confirmed ? i => setSelected(shown[i]) : undefined}
                   />
                   {confirmed ? (
                     <div className="stage-tools">
