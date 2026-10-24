@@ -2,42 +2,48 @@ import type { Advice } from './types'
 
 /** Where to hit the cue ball and how hard. */
 export interface Guide {
-  // Contact point on the cue ball's face, -1..1 from center: x right, y down (follow is negative y).
+  // Contact point, CONTRACT.md "Spin and power": -1..1, x right (english), y up (follow).
+  // 1 = half a ball radius off center, about as far as is safe without miscueing.
   spin: { x: number; y: number }
-  power: number // 0 = softest, 1 = hardest
+  power: number // 0 = barely moving, 1 = a hard break
   label: string
-  example: boolean // test values, not from the coach
+  placeholder: boolean // not real advice: drawn faded
 }
 
+// Fallback when the coach gave words but no physics plan (e.g. a safety).
 const SPIN: Record<Advice['spin'], { x: number; y: number }> = {
   center: { x: 0, y: 0 },
-  follow: { x: 0, y: -0.6 },
-  draw: { x: 0, y: 0.6 },
-  stop: { x: 0, y: 0.25 },
+  follow: { x: 0, y: 0.6 },
+  draw: { x: 0, y: -0.6 },
+  stop: { x: 0, y: -0.25 },
   'left english': { x: -0.6, y: 0 },
   'right english': { x: 0.6, y: 0 },
 }
 
+// Middle of each word's band in the backend's thresholds (0.2 / 0.4 / 0.65).
 const POWER: Record<Advice['speed'], number> = {
-  soft: 0.2,
-  medium: 0.45,
-  firm: 0.7,
-  hard: 0.9,
+  soft: 0.12,
+  medium: 0.3,
+  firm: 0.52,
+  hard: 0.8,
 }
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
 export function guideFromAdvice(advice: Advice): Guide {
-  return {
-    spin: SPIN[advice.spin] ?? SPIN.center,
-    power: POWER[advice.speed] ?? POWER.medium,
-    label: `${advice.spin} · ${advice.speed}`,
-    example: false,
+  const label = `${advice.spin} · ${advice.speed}`
+  // The backend's numbers when it planned the shot; its words always match them.
+  if (advice.physics) {
+    const { spin, power } = advice.physics
+    return {
+      spin: { x: clamp(spin.x, -1, 1), y: clamp(spin.y, -1, 1) },
+      power: clamp(power, 0, 1),
+      label,
+      placeholder: false,
+    }
   }
+  return { spin: SPIN[advice.spin] ?? SPIN.center, power: POWER[advice.speed] ?? POWER.medium, label, placeholder: false }
 }
 
-// Shown until the coach has answered (or when it can't): placeholder values.
-export const TEST_GUIDE: Guide = {
-  spin: { x: 0.2, y: -0.35 },
-  power: 0.55,
-  label: 'example',
-  example: true,
-}
+/** Shown while the coach is thinking, or if it couldn't answer. */
+export const waitingGuide = (label: string): Guide => ({ spin: { x: 0, y: 0 }, power: 0.3, label, placeholder: true })

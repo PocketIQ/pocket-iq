@@ -1,13 +1,13 @@
 import type { Guide } from './spinPower'
 
 function CueBall({ spin, size }: { spin: Guide['spin']; size: string }) {
-  // Keep the dot inside the ball's face even at full offset.
-  const cx = 30 + spin.x * 18
-  const cy = 30 + spin.y * 18
+  // Spin 1 = half the ball's radius from center (the inner ring); screen y grows down.
+  const cx = 30 + spin.x * 13.5
+  const cy = 30 - spin.y * 13.5
   return (
     <svg viewBox="0 0 60 60" className={size} role="img" aria-label="Where to hit the cue ball">
       <circle cx="30" cy="30" r="27" fill="#f8f6ef" stroke="rgba(0,0,0,0.35)" strokeWidth="1.5" />
-      {/* Crosshair so center, follow and draw are easy to read */}
+      {/* Crosshair so center, follow and draw are easy to read; the ring is the safe limit */}
       <path d="M30 6v48M6 30h48" stroke="rgba(0,0,0,0.12)" strokeWidth="1" />
       <circle cx="30" cy="30" r="13.5" fill="none" stroke="rgba(0,0,0,0.12)" strokeWidth="1" />
       <circle cx={cx} cy={cy} r="5" fill="#dc2626" stroke="#7f1d1d" strokeWidth="1" />
@@ -55,7 +55,7 @@ export function ShotGuide({ guide, vertical = false }: { guide: Guide; vertical?
     <div
       className={`flex items-center gap-3 rounded-xl bg-stone-200 p-2 dark:bg-stone-800 ${
         vertical ? 'w-20 flex-col gap-2 py-3' : ''
-      }`}
+      } ${guide.placeholder ? 'opacity-50' : ''}`}
     >
       <CueBall spin={guide.spin} size={vertical ? 'size-14' : 'size-12 shrink-0'} />
       <div className={`flex min-w-0 flex-col gap-1.5 ${vertical ? 'items-center' : 'flex-1'}`}>
