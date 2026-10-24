@@ -5,6 +5,8 @@ import { EditToolbar } from './EditToolbar'
 import { MOCK_TABLE } from './mockTable'
 import { findShots, type Shot } from './physics/shots'
 import { resizeImage } from './resizeImage'
+import { ShotGuide } from './ShotGuide'
+import { guideFromAdvice, TEST_GUIDE } from './spinPower'
 import { RAIL, TableCanvas } from './TableCanvas'
 import type { Tool } from './EditToolbar'
 import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, IntendedShot, LayoutBall, ShotEvent } from './types'
@@ -457,6 +459,7 @@ export default function App() {
     loadView(null)
   }
 
+  const guide = coach.kind === 'done' ? guideFromAdvice(coach.advice) : TEST_GUIDE
   const photoCount = game?.layout?.n ?? 0
   const needsCheck = view ? view.balls.filter(ball => ball.confidence < 0.7).length : 0
   const sunk = new Set(
@@ -545,6 +548,9 @@ export default function App() {
                   </p>
                 )}
 
+                {/* Spin and power take the toolbar's place once the layout is confirmed */}
+                {confirmed && <ShotGuide guide={guide} />}
+
                 {!confirmed && (
                   <EditToolbar
                     tool={tool}
@@ -569,7 +575,11 @@ export default function App() {
                     highlight={picking}
                     onBallTap={confirmed ? undefined : onBallTap}
                   />
-                  {!confirmed && (
+                  {confirmed ? (
+                    <div className="stage-tools">
+                      <ShotGuide vertical guide={guide} />
+                    </div>
+                  ) : (
                     <div className="stage-tools">
                       <EditToolbar
                         vertical
