@@ -11,11 +11,11 @@ opencv-contrib-python-headless   # OpenCV + the ArUco marker module ("headless" 
 numpy                            # array math OpenCV is built on
 
 # --- AI ---
-google-genai            # official Gemini SDK (vision fallback + coaching)
-httpx                   # HTTP client for calling the Backboard API
+google-genai            # official Gemini SDK (shot coaching + identifying balls in photos)
+httpx                   # HTTP client for the ElevenLabs text-to-speech API
 
 # --- Database ---
-pymongo                 # MongoDB Atlas driver (supports mongodb+srv:// out of the box)
+psycopg[binary]         # Postgres driver for Tiger Data (games + shot history)
 
 # --- Auth ---
 pyjwt[crypto]           # verifies Auth0 login tokens sent from the frontend

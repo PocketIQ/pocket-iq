@@ -6,10 +6,10 @@
  * is 2 radii behind the object ball along the pocket→ball line. Aim the cue ball's
  * center there and the object ball goes to the pocket.
  */
-import type { Ball } from '../types'
+import type { Ball, Group } from '../types'
 
+export type { Group }
 export type Vec = { x: number; y: number }
-export type Group = 'solid' | 'stripe' | null // null = table still open
 
 export interface Pocket { name: string; x: number; y: number; side: boolean }
 
