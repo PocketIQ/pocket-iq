@@ -62,6 +62,9 @@ export interface GameAnalyzeResponse extends AnalyzeResponse {
   rejected: Ball[] // detections that matched no ball still in play
   shot: ShotEvent | null // the shot this photo revealed; null for the first photo or no change
   game: Game
+  // A retake not applied yet: `game` is as it was before the photo being retaken, and
+  // confirming the layout (PUT /layout) applies it
+  pending?: boolean
 }
 
 /** One ball in a corrected layout: its identity is trusted as given. */

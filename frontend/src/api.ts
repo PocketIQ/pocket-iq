@@ -67,6 +67,12 @@ export const correctLayout = (id: string, balls: LayoutBall[], intended: Intende
   return request<GameAnalyzeResponse>(`/games/${id}/layout`, { ...init, method: 'PUT' })
 }
 
+/** The player says whose turn it is, when the photos got it wrong. Holds until the next photo. */
+export const setTurn = (id: string, turn: 0 | 1) => {
+  const init = json({ turn })
+  return request<Game>(`/games/${id}/turn`, { ...init, method: 'PUT' })
+}
+
 /**
  * The player fixed the gutter: exactly these balls are pocketed. `balls`: the latest
  * photo's layout with that change made (a ball put in the gutter taken off the table, one

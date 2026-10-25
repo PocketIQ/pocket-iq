@@ -117,7 +117,9 @@ default because it's slow) Gemini double-checks which number each ball is.
 optional `intended` (JSON string of the shot the player went for, e.g.
 `{"target": 2, "pocket": "top_left", "kind": "direct", "cut_angle": 18}`: makes their stats
 count it as made or missed) and `retake` (`"true"`: replace the latest photo instead of
-following it). Returns the `/analyze` response plus:
+following it). A retake is only a preview: nothing is saved, `game` is the game as it was
+before the photo being retaken, and the response has `"pending": true`. Confirming the
+layout with `PUT /games/{id}/layout` applies it. Returns the `/analyze` response plus:
 ```json
 { "missing": ["4"], "rejected": [{"type": "solid", "id": 2, "x": 10, "y": 480, "confidence": 0.4}],
   "revived": [],
@@ -146,6 +148,10 @@ or removed balls). Same response as `/analyze`, with `shot` recomputed.
 - `intended` (optional): omit to keep the one sent with the original photo
 - a ball pocketed in an earlier shot can be put back: it's revived (listed in `revived`)
 - 409 if a ball is listed twice, or the 8 is listed after the game ended
+
+`PUT /games/{id}/turn` `{"turn": 1}` → `Game`: the player says whose turn it is (index into
+`players`), when the photos got it wrong. It holds through a layout correction of the
+latest photo, until the next photo. 409 once the game is over.
 
 `PUT /games/{id}/pocketed`: the player fixed the gutter. Same response as `/analyze`
 (`shot` is always null; `balls` is the latest photo's layout after the fix).

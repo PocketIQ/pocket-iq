@@ -251,6 +251,7 @@ def process_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     Returns {balls, missing, rejected, shot}: shot is the history event, or None.
     """
     state["undo"] = _snapshot(state)
+    state.pop("turn_fixed", None)    # a turn the player set holds until the next photo
     first = state["photo"] is None
     live = on_table(state)
     before = {b: (state["balls"][b]["x"], state["balls"][b]["y"])
@@ -301,8 +302,10 @@ def replace_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     intended = intended or state["photo"].get("intended")   # keep what the player went for
     undone = state["history"][-1] if state["history"] and \
         state["history"][-1].get("photo") == state["photos"] else None
-    # Who the player said the latest shot's balls count for, to keep through the replay
+    # Who the player said the latest shot's balls count for, and whose turn they said it
+    # is, to keep through the replay
     fixed = {e["ball"]: e for e in gutter(state) if e["photo"] == state["photos"]}
+    fixed_turn = state.get("turn_fixed")
     snapshot = state["undo"]
     state.clear()
     state.update(snapshot)
@@ -310,7 +313,32 @@ def replace_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     for e in gutter(state):
         if e["photo"] == state["photos"] and e["ball"] in fixed:
             e.update(by=fixed[e["ball"]]["by"], member=fixed[e["ball"]]["member"])
+    if fixed_turn is not None and state["winner"] is None:
+        state["turn"] = state["turn_fixed"] = fixed_turn
     return {**result, "undone": undone}
+
+
+def preview_retake(state: dict, detections: list[dict], *, intended: dict | None = None) -> dict:
+    """
+    A retake of the latest photo, NOT applied: the game is left as it is until the player
+    confirms the layout (PUT /layout replays the photo then). Returns what replace_photo
+    would ({balls, missing, rejected, shot}) plus `before`: the game as it was before the
+    photo being retaken, which is what the player should see while checking the retake.
+    """
+    if state["undo"] is None:
+        raise GameError("There's no photo to retake yet. Take a photo of the table first.")
+    trial = copy.deepcopy(state)
+    result = replace_photo(trial, detections, intended=intended)
+    return {**result, "before": copy.deepcopy(state["undo"])}
+
+
+def set_turn(state: dict, turn: int) -> None:
+    """The player says whose turn it is (the photos got it wrong). Holds until the next photo."""
+    if state["winner"] is not None:
+        raise GameError("This game is over. Start a new one.")
+    if turn not in (0, 1):
+        raise GameError("Turn is player 0 or player 1.")
+    state["turn"] = state["turn_fixed"] = turn
 
 
 # ------------------------------------------------------------------ rules

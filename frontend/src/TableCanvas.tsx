@@ -76,6 +76,11 @@ function shotIndexAt(data: AnalyzeResponse, shots: Shot[], canvas: HTMLCanvasEle
   return nearest
 }
 
+// Same as the full-screen media query in index.css
+const FULLSCREEN_MQ = '(orientation: landscape) and (max-height: 500px)'
+const DIAMOND_SILVER = '#d6d9de'
+const FLASH_MS = 1600 // two gentle pulses when the turn changes
+
 type Press = {
   pointerId: number
   x: number
@@ -163,6 +168,7 @@ export function TableCanvas({
   cueAfter = null,
   showConfidence = true,
   highlight = null,
+  turnColor = null,
   onBallTap,
   onShotTap,
   onTableTap,
@@ -175,6 +181,8 @@ export function TableCanvas({
   showConfidence?: boolean
   /** Index of a ball to ring, e.g. the one the ball picker is open for. */
   highlight?: number | null
+  /** The shooter's color: in full screen the diamonds take it, and flash softly when it changes. */
+  turnColor?: string | null
   onBallTap?: (index: number) => void
   /** Tapping a shot's line: index into `shots`. Used when balls aren't editable. */
   onShotTap?: (index: number) => void
@@ -183,6 +191,8 @@ export function TableCanvas({
 }) {
   const ref = useRef<HTMLCanvasElement>(null)
   const press = useRef<Press | null>(null)
+  const drawRef = useRef<(() => void) | null>(null)
+  const flash = useRef(0) // 0..1 while the diamonds pulse
 
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (e.button !== 0) return
@@ -263,11 +273,17 @@ export function TableCanvas({
       const sights: [number, number, boolean][] = [] // x, y, on a long rail
       for (const k of [1, 2, 3, 5, 6, 7]) sights.push([(TW * k) / 8, -mid, true], [(TW * k) / 8, TH + mid, true])
       for (const k of [1, 2, 3]) sights.push([-mid, (TH * k) / 4, false], [TW + mid, (TH * k) / 4, false])
-      ctx.fillStyle = '#d6d9de'
+      // In full screen (no scoreboard in view) they're the shooter's color instead of silver
+      const tint = turnColor && window.matchMedia(FULLSCREEN_MQ).matches ? turnColor : null
+      const glow = tint ? flash.current : 0
+      ctx.fillStyle = tint ?? DIAMOND_SILVER
       ctx.strokeStyle = 'rgba(0,0,0,0.35)'
       ctx.lineWidth = 1
+      ctx.shadowColor = tint ?? 'transparent'
+      ctx.shadowBlur = 14 * glow
       for (const [x, y, long] of sights) {
-        const [w, h] = long ? [9, 5] : [5, 9] // half-sizes, longer along the rail
+        const grow = 1 + 0.3 * glow
+        const [w, h] = (long ? [9, 5] : [5, 9]).map(v => v * grow) // half-sizes, longer along the rail
         ctx.beginPath()
         ctx.moveTo(x - w, y)
         ctx.lineTo(x, y - h)
@@ -277,6 +293,7 @@ export function TableCanvas({
         ctx.fill()
         ctx.stroke()
       }
+      ctx.shadowBlur = 0
 
       // Pockets: 4 corners + 2 side
       ctx.fillStyle = '#0a0a0a'
@@ -343,11 +360,33 @@ export function TableCanvas({
     }
 
     // Watch the canvas itself, not the window: rotating into landscape resizes it via CSS.
+    drawRef.current = draw
     draw()
     const observer = new ResizeObserver(draw)
     observer.observe(canvas)
     return () => observer.disconnect()
-  }, [data, shots, selected, cueAfter, showConfidence, highlight])
+  }, [data, shots, selected, cueAfter, showConfidence, highlight, turnColor])
+
+  // The turn changed: pulse the diamonds twice so it's noticed without a word on screen.
+  const lastColor = useRef(turnColor)
+  useEffect(() => {
+    if (turnColor === lastColor.current) return
+    lastColor.current = turnColor
+    if (!turnColor || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    const start = performance.now()
+    let frame = 0
+    const tick = (now: number) => {
+      const t = now - start
+      flash.current = t < FLASH_MS ? Math.sin((Math.PI * 2 * t) / FLASH_MS) ** 2 : 0
+      drawRef.current?.()
+      if (t < FLASH_MS) frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => {
+      cancelAnimationFrame(frame)
+      flash.current = 0
+    }
+  }, [turnColor])
 
   return (
     <canvas

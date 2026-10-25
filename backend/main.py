@@ -225,7 +225,9 @@ async def analyze_in_game(
     disappeared went in, a missing cue ball is a scratch. That shot is applied to the
     game (turns, groups, winner) and returned as `shot`.
     `intended`: JSON of the shot the player went for (makes their stats count it).
-    `retake`: this photo replaces the latest one instead of following it.
+    `retake`: this photo replaces the latest one instead of following it. It's only a
+    preview: nothing is saved, `game` is the game as it was before the photo being
+    retaken, and `pending` is true. Confirming the layout (PUT /layout) applies it.
     """
     state = _load(game_id)
     try:
@@ -238,11 +240,22 @@ async def analyze_in_game(
     balls, not_balls = _vision(await _read_photo(photo))
     try:
         if retake:
-            result = game.replace_photo(state, balls, intended=meant)
+            preview = game.preview_retake(state, balls, intended=meant)
         else:
             result = game.process_photo(state, balls, intended=meant)
     except game.GameError as e:
         raise HTTPException(409, str(e))
+    if retake:   # a bad photo shouldn't change the game until the player checks the retake
+        return {
+            "table": {"width": TABLE_W, "height": TABLE_H},
+            "ball_radius": BALL_RADIUS,
+            "balls": preview["balls"],
+            "missing": preview["missing"],
+            "rejected": preview["rejected"] + list(not_balls),
+            "shot": preview["shot"],
+            "game": game.public(preview["before"]),
+            "pending": True,
+        }
     return _photo_result(state, result, not_balls)
 
 
@@ -260,6 +273,22 @@ def correct_layout(game_id: str, body: Layout):
     except game.GameError as e:
         raise HTTPException(409, str(e))
     return _photo_result(state, result)
+
+
+class Turn(BaseModel):
+    turn: int = Field(ge=0, le=1)
+
+
+@app.put("/games/{game_id}/turn")
+def set_turn(game_id: str, body: Turn):
+    """The player says whose turn it is, when the photos got it wrong."""
+    state = _load(game_id)
+    try:
+        game.set_turn(state, body.turn)
+    except game.GameError as e:
+        raise HTTPException(409, str(e))
+    _save(state)
+    return game.public(state)
 
 
 @app.put("/games/{game_id}/pocketed")

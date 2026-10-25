@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { adviceAudioUrl, analyzeGamePhoto, correctLayout, correctPocketed, createGame, getAdvice, getGame, planShot } from './api'
+import { adviceAudioUrl, analyzeGamePhoto, correctLayout, correctPocketed, createGame, getAdvice, getGame, planShot, setTurn } from './api'
 import type { PlanResponse } from './api'
 import { BallPicker } from './BallPicker'
 import { Banner } from './Banner'
@@ -117,10 +117,32 @@ function difficultyLabel(difficulty: number): string {
   return 'Hard'
 }
 
-function Scoreboard({ game, up }: { game: Game; up: string | null }) {
+function SwapButton({ onClick, disabled }: { onClick: () => void; disabled: boolean }) {
   return (
-    <div className="grid grid-cols-2 gap-2">
-      {game.players.map((p, i) => {
+    <button
+      type="button"
+      aria-label="Switch whose turn it is"
+      title="Switch whose turn it is"
+      onClick={onClick}
+      disabled={disabled}
+      className="flex size-9 items-center justify-center self-center rounded-full bg-stone-200 text-stone-600 active:bg-stone-300 disabled:opacity-30 dark:bg-stone-800 dark:text-stone-300 dark:active:bg-stone-700"
+    >
+      <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M4 9h15l-4-4M20 15H5l4 4" />
+      </svg>
+    </button>
+  )
+}
+
+function Scoreboard({ game, up, onSwap, swapDisabled }: {
+  game: Game
+  up: string | null
+  onSwap: () => void
+  swapDisabled: boolean
+}) {
+  return (
+    <div className="grid grid-cols-[1fr_auto_1fr] gap-2">
+      {game.players.flatMap((p, i) => {
         const left = p.group
           ? Object.entries(game.balls).filter(
             ([b, s]) => s === 'on' && b !== 'cue' && b !== '8' && (Number(b) < 8) === (p.group === 'solid'),
@@ -128,10 +150,10 @@ function Scoreboard({ game, up }: { game: Game; up: string | null }) {
           : null
         const isUp = game.winner == null && game.turn === i
         const shooter = isUp ? up : null
-        return (
+        const card = (
           <div
             key={p.name}
-            className={`rounded-lg px-3 py-2 ${isUp ? 'bg-emerald-700 text-white' : 'bg-stone-200 dark:bg-stone-800'}`}
+            className={`min-w-0 rounded-lg px-3 py-2 ${isUp ? 'bg-emerald-700 text-white' : 'bg-stone-200 dark:bg-stone-800'}`}
           >
             <div className="flex items-center gap-1.5 font-semibold">
               <span className="size-2.5 shrink-0 rounded-full ring-1 ring-black/20" style={{ background: SIDE_COLORS[i] }} aria-hidden="true" />
@@ -143,6 +165,8 @@ function Scoreboard({ game, up }: { game: Game; up: string | null }) {
             </div>
           </div>
         )
+        // The swap button sits between the two players
+        return i === 0 ? [card, <SwapButton key="swap" onClick={onSwap} disabled={swapDisabled} />] : [card]
       })}
     </div>
   )
@@ -303,6 +327,7 @@ export default function App() {
   const [plan, setPlan] = useState<{ shot: Shot; result: PlanResponse | null } | null>(null)
   const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
   const [hideTestTools, setHideTestTools] = useState(testToolsHidden)
+  const [pendingRetake, setPendingRetake] = useState(false) // a retake shown but not applied until confirmed
   const [placing, setPlacing] = useState<number | null>(null) // ball taken out of the gutter, to put on the table
 
   const busy = status.kind === 'loading'
@@ -394,6 +419,7 @@ export default function App() {
     setHistory(EMPTY_HISTORY)
     setPicking(null)
     setPlacing(null)
+    setPendingRetake(false)
     setSelected(0)
     resetCoach()
   }
@@ -424,6 +450,10 @@ export default function App() {
   // the table, or puts one back. Unsaved layout edits are kept; the coach starts over.
   async function saveGutter(next: GutterEntry[], change?: TableChange) {
     if (!game || busy) return
+    if (pendingRetake) {
+      setStatus({ kind: 'error', message: 'Confirm the retaken photo first: until then the gutter is from before it.' })
+      return
+    }
     let saved: Ball[] | null = serverBalls && change ? changeTable(serverBalls, change) : serverBalls
     if (devMode) {
       setGame(withGutter(game, next))
@@ -476,6 +506,10 @@ export default function App() {
   // works out what went in by comparing it with the previous photo.
   async function handlePhoto(file: File, retake: boolean) {
     if (!game) return
+    if (pendingRetake && !retake) {
+      setStatus({ kind: 'error', message: 'Confirm the retaken photo first (or retake it again).' })
+      return
+    }
     // The shot selected on screen is the one they went for: it's what counts as made or
     // missed in their stats. A retake keeps what was sent with the original photo.
     const shot = shots[selected]
@@ -487,8 +521,29 @@ export default function App() {
       analyzeGamePhoto(game.id, await resizeImage(file), { intended, retake }),
     )
     if (!res) return
+    // A retake comes back unapplied: the game as it was before the bad photo, until confirmed
     setGame(res.game)
     loadView(res)
+    setPendingRetake(!!res.pending)
+  }
+
+  // The photos got the turn wrong: the player switches it by hand.
+  async function swapTurn() {
+    if (!game || busy || game.winner != null) return
+    if (pendingRetake) {
+      setStatus({ kind: 'error', message: 'Confirm the retaken photo first.' })
+      return
+    }
+    const turn = game.turn === 0 ? 1 : 0
+    if (devMode) setGame({ ...game, turn })
+    else {
+      const g = await run('Switching turns…', () => setTurn(game.id, turn))
+      if (!g) return
+      setGame(g)
+    }
+    // Shots and advice were for the other player
+    setConfirmed(false)
+    resetCoach()
   }
 
   function onBallTap(index: number) {
@@ -549,7 +604,8 @@ export default function App() {
     }
     let current = view
     let currentGame = game
-    if (!devMode && view.balls !== serverBalls) {
+    // A retake is only applied now (the backend replays it in place of the bad photo)
+    if (!devMode && (view.balls !== serverBalls || pendingRetake)) {
       const res = await run('Saving your fixes…', () => correctLayout(game.id, toLayout(view.balls)))
       if (!res) return
       current = res
@@ -557,6 +613,7 @@ export default function App() {
       setGame(res.game)
       setView(res)
       setServerBalls(res.balls)
+      setPendingRetake(false)
     }
     setStatus({ kind: 'idle' })
     setConfirmed(true)
@@ -686,9 +743,19 @@ export default function App() {
 
         {game && (
           <>
-            <Scoreboard game={game} up={turns?.up ?? null} />
+            <Scoreboard
+              game={game}
+              up={turns?.up ?? null}
+              onSwap={swapTurn}
+              swapDisabled={busy || game.winner != null}
+            />
 
-            {view?.shot ? (
+            {pendingRetake ? (
+              <p className="rounded-lg bg-amber-100 px-4 py-3 text-sm text-amber-950 dark:bg-amber-950 dark:text-amber-100">
+                <span className="font-semibold">Retake:</span> the game is back to before the last photo. Check this
+                layout and confirm it to replace that photo; nothing changes until you do.
+              </p>
+            ) : view?.shot ? (
               <p className="rounded-lg bg-white px-4 py-3 text-sm shadow-sm dark:bg-stone-900">
                 <span className="font-semibold">Last shot:</span> {describeShot(view.shot)}.{' '}
                 <span className="text-stone-500">Wrong? Fix the layout or retake the photo.</span>
@@ -718,7 +785,7 @@ export default function App() {
                 }
               />
             )}
-            {photoCount > 0 && (
+            {(photoCount > 0 || pendingRetake) && (
               <PhotoButton disabled={busy} onFile={f => handlePhoto(f, true)} label="Retake the last photo" />
             )}
 
@@ -763,6 +830,7 @@ export default function App() {
                       onBallTap={confirmed ? undefined : onBallTap}
                       onShotTap={confirmed ? i => setSelected(shown[i]) : undefined}
                       onTableTap={placing == null ? undefined : placeBall}
+                      turnColor={game.winner == null ? SIDE_COLORS[game.turn] : null}
                     />
                     <div className="stage-gutter">{gutterPanel(true)}</div>
                   </div>
