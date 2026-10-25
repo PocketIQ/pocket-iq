@@ -153,15 +153,6 @@ export function Gutter({ game, rosters, balls, loose, compact = false, onSetWho,
           {loose.length === 1 ? 'it' : 'each'} on the table or in the gutter.
         </p>
       )}
-      {!compact && <p className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-xs text-stone-500">
-        {game.players.map((p, i) => (
-          <span key={p.name} className="flex items-center gap-1">
-            <span className="size-2.5 rounded-full" style={{ background: SIDE_COLORS[i] }} aria-hidden="true" />
-            {p.name}
-          </span>
-        ))}
-        <span>dashed = opponent’s ball · no ring = break</span>
-      </p>}
 
       {locating != null && (
         <Sheet title={`Where’s the ${ballName(locating)}?`} onClose={() => setLocating(null)}>

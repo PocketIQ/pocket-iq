@@ -104,11 +104,6 @@ function changeTable(balls: Ball[], change: TableChange): Ball[] {
   return 'off' in change ? balls.filter(b => b.id !== change.off) : [...balls, change.on]
 }
 
-const TOOL_HINTS: Record<Tool, string> = {
-  label: 'Tap a ball to say which one it is.',
-  remove: 'Tap a ball that isn’t really there.',
-}
-
 const pocketName = (p: string) => p.replaceAll('_', ' ')
 
 function difficultyLabel(difficulty: number): string {
@@ -702,10 +697,6 @@ export default function App() {
       />
       <div className="mx-auto max-w-2xl px-4 py-5 flex flex-col gap-5">
         <h1 className="sr-only">PocketIQ</h1>
-        <p className="-mb-2 text-sm text-stone-600 dark:text-stone-400">
-          After every shot, once the balls stop, snap the whole table before anyone touches it.
-        </p>
-
         {status.kind === 'error' && (
           <p role="alert" className="rounded-lg bg-red-100 px-4 py-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-200">
             {status.message}
@@ -756,14 +747,14 @@ export default function App() {
                 layout and confirm it to replace that photo; nothing changes until you do.
               </p>
             ) : view?.shot ? (
-              <p className="rounded-lg bg-white px-4 py-3 text-sm shadow-sm dark:bg-stone-900">
+              <p className="px-1 text-sm">
                 <span className="font-semibold">Last shot:</span> {describeShot(view.shot)}.{' '}
                 <span className="text-stone-500">Wrong? Fix the layout or retake the photo.</span>
               </p>
             ) : (
               view &&
               photoCount > 1 && (
-                <p className="rounded-lg bg-white px-4 py-3 text-sm text-stone-600 shadow-sm dark:bg-stone-900 dark:text-stone-400">
+                <p className="px-1 text-sm text-stone-600 dark:text-stone-400">
                   Nothing moved since the last photo, so no shot was recorded.
                 </p>
               )
@@ -891,7 +882,6 @@ export default function App() {
 
                 {!confirmed ? (
                   <>
-                    <p className="text-sm text-stone-600 dark:text-stone-400">{TOOL_HINTS[tool]}</p>
                     <p className="text-xs text-stone-500">
                       {view.balls.length} balls · dashed ring = unsure
                       {view.missing.length > 0 &&
