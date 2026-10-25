@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 
 import physics
 import store
@@ -20,34 +21,33 @@ from game import ball_type, remaining
 
 log = logging.getLogger("cueiq.coach")
 
-SYSTEM_PROMPT = """You are CueIQ, a friendly, expert 8-ball pool coach.
-You get the table state, the player's real shooting stats, and a numbered list of
-candidate shots. The candidates' geometry (cut angle, distances, path is clear) is
-computed exactly: trust it, never invent shots.
-Pick the shot that gives the best chance to pocket a ball AND leave the cue ball in good
-position for the next one. Use the stats: steer them away from the shot types they
-keep missing and toward the ones they make, and mention it when it matters. If no
-candidate is reasonable, use shot_index -1 and describe a safety instead.
-Most candidates come with a physics plan: the power (0 to 1) and cue ball spin that
-pocket the ball and leave the best position, where the cue ball ends up, and the next
-shot from there. Prefer shots with a plan. For the shot you pick, describe exactly its
-plan's speed and spin (don't invent different ones), and use its ending spot and next
-shot in cue_ball_after. Spin y is follow (+) or draw (-); spin x is right (+) or left (-)
-english; 1 means the tip half a ball-radius off center.
-Explain like you're standing next to them: concrete, short, no jargon without a hint.
-Your aim, cue_ball_after and tip are read aloud, so write them as spoken sentences."""
+SYSTEM_PROMPT = """You are CueIQ, a pool coach standing next to the player. Talk like a friend
+giving a quick tip at the table: short, concrete, "you".
+Pick the candidate shot that pockets a ball AND leaves the easiest next shot. Use the
+player's stats: steer them away from shots they keep missing. Only use the candidates
+listed; never invent a shot. If none is reasonable, use shot_index -1 and describe a
+simple safety in aim.
+Each candidate comes with its aim, a plan (speed, spin, where the cue ball stops, the
+next shot) and, with ball in hand, where to put the cue ball. Use those exactly: don't
+invent a different speed, spin, aim or spot.
+Every field is ONE short sentence of at most 15 words. Never give coordinates or
+distances in units, never mention candidate numbers, never repeat the speed and spin
+(the app shows them)."""
 
 ADVICE_SCHEMA = {
     "type": "object",
     "properties": {
         "shot_index": {"type": "integer", "description": "candidate number, or -1 for a safety"},
-        "aim": {"type": "string", "description": "where to aim, in plain words"},
+        "aim": {"type": "string", "description": "one sentence, max 15 words: where to aim (and, "
+                "with ball in hand, where to put the cue ball), from the candidate's aim"},
         "speed": {"type": "string", "enum": ["soft", "medium", "firm", "hard"]},
         "spin": {"type": "string", "enum": ["center", "follow", "draw", "stop",
                                             "left english", "right english"]},
-        "cue_ball_after": {"type": "string", "description": "where the cue ball should end up, and why"},
-        "why": {"type": "string", "description": "why this shot over the others"},
-        "tip": {"type": "string", "description": "one tip personal to this player"},
+        "cue_ball_after": {"type": "string", "description": "one sentence, max 15 words: where "
+                           "the cue ball ends up and the next shot it leaves"},
+        "why": {"type": "string", "description": "one sentence, max 15 words: why this shot"},
+        "tip": {"type": "string", "description": "one sentence, max 12 words, personal to this "
+                "player's stats; empty string if there's nothing specific to say"},
     },
     "required": ["shot_index", "aim", "speed", "spin", "cue_ball_after", "why", "tip"],
 }
@@ -114,17 +114,66 @@ def _describe_stats(stats: dict | None) -> list[str]:
     return lines
 
 
+POCKET_WORDS = {"top_left": "top left", "top_side": "top side", "top_right": "top right",
+                "bottom_left": "bottom left", "bottom_side": "bottom side", "bottom_right": "bottom right"}
+
+
+def _where(x: float, y: float) -> str:
+    """A spot on the table in words ("near the top right pocket", "on the bottom rail,
+    left of the side pocket", "in the middle of the table")."""
+    pk = min(physics.pockets(), key=lambda p: math.hypot(x - p.x, y - p.y))
+    if math.hypot(x - pk.x, y - pk.y) < 90:
+        return f"near the {POCKET_WORDS[pk.name]} pocket"
+    rails = {"top rail": y, "bottom rail": physics.TABLE_H - y,
+             "left end rail": x, "right end rail": physics.TABLE_W - x}
+    rail, gap = min(rails.items(), key=lambda kv: kv[1])
+    if gap < 35:
+        if rail in ("top rail", "bottom rail"):
+            part = "left of the side pocket" if x < physics.TABLE_W / 2 else "right of the side pocket"
+            return f"on the {rail}, {part}"
+        return f"on the {rail}"
+    col = "left side" if x < physics.TABLE_W / 3 else "right side" if x > 2 * physics.TABLE_W / 3 else "middle"
+    row = "top" if y < physics.TABLE_H / 3 else "bottom" if y > 2 * physics.TABLE_H / 3 else ""
+    if col == "middle":
+        return f"in the {row + ' ' if row else ''}middle of the table"
+    return f"on the {row + ' ' if row else ''}{col} of the table"
+
+
+def _aim(cue: tuple, shot: "physics.Shot", balls: list[dict]) -> str:
+    """How to hit the object ball: fullness from the cut angle, side from the geometry."""
+    n = shot.target_id
+    cut = shot.cut
+    if cut < 4:
+        return f"straight into the {n}, full ball"
+    full = ("three-quarter" if cut < 22 else "half" if cut < 38 else "quarter" if cut < 55 else "thin")
+    t = balls[shot.target_index]
+    d = (shot.ghost[0] - cue[0], shot.ghost[1] - cue[1])
+    v = (t["x"] - cue[0], t["y"] - cue[1])
+    side = "left" if d[0] * v[1] - d[1] * v[0] > 0 else "right"   # y points down
+    return f"{full} ball on the {side} side of the {n}"
+
+
+def _placement(cue: tuple, shot: "physics.Shot", balls: list[dict]) -> str:
+    """Where to put the cue ball, with ball in hand, in words."""
+    t = balls[shot.target_index]
+    widths = max(1, round(math.hypot(cue[0] - t["x"], cue[1] - t["y"]) / (2 * physics.R)) - 1)
+    back = f"about {widths} ball-width{'s' if widths > 1 else ''} back"
+    pocket = POCKET_WORDS[shot.pocket.name]
+    if shot.cut < 4:
+        return f"straight behind the {shot.target_id}, in line with the {pocket} pocket, {back}"
+    return f"behind the {shot.target_id}, slightly off the line to the {pocket} pocket, {back}"
+
+
 def _describe_plan(plan: dict | None) -> str:
     if plan is None:
-        return ". Physics: no tried power/spin pockets it reliably."
-    spin = plan["spin"]
+        return " Physics: no power or spin pockets it reliably."
     nxt = plan["next_shot"]
-    after = (f"leaves the {nxt['target_ball']} into {nxt['pocket'].replace('_', ' ')} "
-             f"(cut {nxt['cut_angle']} deg)" if nxt else "leaves no easy next shot")
-    return (f". Plan: power {plan['power']:.2f} ({physics.speed_word(plan['power'])}), "
-            f"{physics.spin_word((spin['x'], spin['y']))} (spin x {spin['x']:+.1f}, y {spin['y']:+.1f}); "
-            f"cue ball ends near ({plan['cue_stop']['x']:.0f}, {plan['cue_stop']['y']:.0f})"
-            f"{', SCRATCH RISK' if plan['scratch'] else ''}, {after}")
+    after = (f"leaves the {nxt['target_ball']} into the {POCKET_WORDS[nxt['pocket']]} pocket"
+             if nxt else "leaves no easy next shot")
+    stop = plan["cue_stop"]
+    return (f" Plan: {physics.speed_word(plan['power'])}, "
+            f"{physics.spin_word((plan['spin']['x'], plan['spin']['y']))}; the cue ball stops "
+            f"{_where(stop['x'], stop['y'])}{' (SCRATCH RISK)' if plan['scratch'] else ''} and {after}.")
 
 
 def _describe(state: dict, candidates: list[dict], stats: dict | None,
@@ -139,15 +188,14 @@ def _describe(state: dict, candidates: list[dict], stats: dict | None,
         f"Opponent {opp['name']}: {opp['group'] + 's' if opp['group'] else 'no group yet'}, "
         f"{len(remaining(state, opp['group'])) if opp['group'] else '?'} balls left.",
         *_describe_stats(stats),
-        "Table is 1000 x 500 units (x right, y down), pockets at the 4 corners and the middle "
-        "of the top and bottom rails. Balls on the table (last seen position):",
+        "Balls on the table:",
     ]
     for b, v in state["balls"].items():
         if b == "cue" and spots:
             continue
         if v["status"] == "on" and v["x"] is not None:
             label = "cue ball" if b == "cue" else f"{b} ({ball_type(b)})"
-            lines.append(f"  {label} at ({v['x']:.0f}, {v['y']:.0f})")
+            lines.append(f"  {label}: {_where(v['x'], v['y'])}")
     recent = state["history"][-6:]
     if recent:
         lines.append("Recent shots this game:")
@@ -159,20 +207,46 @@ def _describe(state: dict, candidates: list[dict], stats: dict | None,
                          f"{called} -> {e['result']}")
     if spots:
         lines.append("BALL IN HAND: the opponent scratched, so the player puts the cue ball anywhere. "
-                     "Each candidate says where to place it; tell them where in aim.")
+                     "Each candidate says where to put it; say that in aim (the app marks the spot too).")
     lines.append("Candidate shots (difficulty 0 = easy, 1+ = hard):")
+    group = me["group"]
+    balls = physics.balls_from_state(state)
+    cue_ball = next(((b["x"], b["y"]) for b in balls if b["type"] == "cue"), None)
     for c in candidates:
+        cue = (spots[c["index"]]["x"], spots[c["index"]]["y"]) if spots and c["index"] in spots else cue_ball
+        layout = balls if not spots else [*balls, {"id": None, "type": "cue", "x": cue[0], "y": cue[1]}]
+        shot = cue and physics.match_shot(layout, group, c["target_id"], c["pocket"], c["kind"], c["cut_angle"])
+        how = ""
+        if shot:
+            how = f" Aim: {_aim(cue, shot, layout)}."
+            if spots:
+                how = f" Put the cue ball {_placement(cue, shot, layout)}." + how
+        reach = "short" if c["cue_distance"] < 250 else "long" if c["cue_distance"] > 550 else "medium"
         lines.append(
-            f"  #{c['index']}: the {c['target_id']} into {c['pocket'].replace('_', ' ')}, "
-            f"{c['kind']}, cut {c['cut_angle']:.0f} deg, cue ball travels {c['cue_distance']:.0f}, "
-            f"object ball travels {c['target_distance']:.0f}, difficulty {c['difficulty']}"
-            + (f", cue ball placed at ({spots[c['index']]['x']:.0f}, {spots[c['index']]['y']:.0f})"
-               if spots and c["index"] in spots else "")
-            + _describe_plan(plans.get(c["index"]))
+            f"  #{c['index']}: the {c['target_id']} into the {POCKET_WORDS.get(c['pocket'], c['pocket'])} "
+            f"pocket, {c['kind']}, {c['cut_angle']:.0f} degree cut, {reach} cue ball travel, "
+            f"difficulty {c['difficulty']}.{how}" + _describe_plan(plans.get(c["index"]))
         )
     if not candidates:
         lines.append("  (none: no clear shot at a legal ball)")
     return "\n".join(lines)
+
+
+_COORDS = re.compile(r"(\s+(at|near|to|around|by))?\s*\(?\b\d{2,4}(\.\d+)?\s*,\s*\d{2,4}(\.\d+)?\b\)?")
+_SHOT_REF = re.compile(r"\b(shot|candidate|option)\s*#?\s*(\d+|zero|one|two|three)\b", re.I)
+MAX_WORDS = 22
+
+
+def _tidy(text: str) -> str:
+    """Keep the model honest about length and never let coordinates through: drop any
+    "(798, 279)", references to candidate numbers, and anything past the first sentence."""
+    text = _COORDS.sub("", text or "")
+    text = _SHOT_REF.sub("this shot", text)
+    text = re.split(r"(?<=[.!?])\s", text.strip(), maxsplit=1)[0]
+    words = text.split()
+    if len(words) > MAX_WORDS:
+        text = " ".join(words[:MAX_WORDS]).rstrip(",;:") + "."
+    return text.strip()
 
 
 def _validate(advice: dict, candidates: list[dict]) -> dict:
@@ -184,6 +258,8 @@ def _validate(advice: dict, candidates: list[dict]) -> dict:
     advice["pocket"] = chosen["pocket"] if chosen else None
     for k in ("aim", "speed", "spin", "cue_ball_after", "why", "tip"):
         advice.setdefault(k, "")
+    for k in ("aim", "cue_ball_after", "why", "tip"):
+        advice[k] = _tidy(advice[k])
     return advice
 
 
@@ -299,6 +375,8 @@ def advise(state: dict, candidates: list[dict]) -> dict:
         log.warning("gemini failed: %s", e)
         raise CoachError(f"The coach is unavailable right now ({type(e).__name__}: {e}).") from e
 
+    if not stats or not stats.get("attempts"):
+        advice["tip"] = ""     # a "personal" tip with no history to go on is just filler
     chosen = next((c for c in candidates if c["index"] == advice["shot_index"]), None)
     if spots:
         plan = plans.get(chosen["index"]) if chosen else None
@@ -320,13 +398,13 @@ def advise(state: dict, candidates: list[dict]) -> dict:
 
 
 def speech(advice: dict) -> str:
-    """The advice as something to say out loud."""
+    """The advice as something to say out loud: what, how, and where the cue ball goes.
+    Short on purpose (the why and the tip stay on screen)."""
     if advice.get("target_ball") is None:
         opening = "No good shot here. Play safe."
     else:
-        opening = f"Go for the {advice['target_ball']} in the {advice['pocket'].replace('_', ' ')} pocket."
-    spin = "" if advice["spin"] == "center" else f" with {advice['spin']}"
-    return " ".join(s for s in (
-        opening, advice["aim"], f"Hit it {advice['speed']}{spin}.",
-        advice["cue_ball_after"], advice["tip"],
-    ) if s)
+        opening = f"The {advice['target_ball']} in the {POCKET_WORDS[advice['pocket']]} pocket."
+    spin = "" if advice["spin"] == "center" else f", with {advice['spin']}"
+    return " ".join(x for x in (
+        opening, advice["aim"], f"{advice['speed'].capitalize()} speed{spin}.", advice["cue_ball_after"],
+    ) if x)

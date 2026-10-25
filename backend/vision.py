@@ -6,6 +6,7 @@ Every number you'll want to tune is in the CONFIG block. Run tools/debug_vision.
 real photos to see what each stage produces before touching anything else.
 """
 import logging
+import math
 import os
 from dataclasses import dataclass
 from itertools import combinations
@@ -44,7 +45,11 @@ BALL_MIN_HUE_DIFF = 12     # LAB a/b distance from the felt a ball's color must 
 YOLO_MODEL = Path(__file__).resolve().parent / "models" / "balls.onnx"
 YOLO_SIZE = 1024           # model input, px square: must match tools/train_yolo.py
 YOLO_CONF = 0.35           # min score for a box to count as a ball
-YOLO_NMS = 0.45            # boxes overlapping more than this (IoU) are one ball
+YOLO_NMS = 0.6             # boxes overlapping more than this (IoU) are one ball (balls in a
+                           # rack overlap in a low photo: keep this loose, dedupe by distance)
+YOLO_TILE_OVERLAP = 0.25   # the left and right halves overlap by this share of a half
+YOLO_SAME_BALL = 0.9       # two boxes from one run closer than this x radius are one ball
+YOLO_SAME_BALL_PASSES = 1.3  # same, between the full view and a half (their boxes differ more)
 TABLE_CROP_MARGIN = 30     # table units of rail/floor kept around the playing area in crops
 # --------------------------------------------------------------------------
 
@@ -613,33 +618,57 @@ def decode_yolo(out: np.ndarray, conf: float = YOLO_CONF, nms: float = YOLO_NMS)
     return [(*pred[i, :4].astype(float), float(scores[i])) for i in np.array(keep).reshape(-1)]
 
 
+def _yolo_pass(net, img: np.ndarray, box: tuple, seams: tuple = ()) -> list[tuple]:
+    """One model run on a photo region: [(x, y, r, score)] in photo px. `seams`: sides
+    ("left"/"right") cut through the table; a ball touching one is only partly in this
+    region, and the region beside it has it whole, so it's skipped here."""
+    x0, y0, x1, y1 = box
+    square, k, left, top = _letterbox(img[y0:y1, x0:x1], YOLO_SIZE)
+    net.setInput(cv2.dnn.blobFromImage(square, 1 / 255.0, swapRB=True))
+    out = []
+    for bx, by, bw, bh, score in decode_yolo(net.forward()):
+        x, y, r = (bx - left) / k + x0, (by - top) / k + y0, (bw + bh) / 4 / k
+        if ("left" in seams and x - r < x0 + 2) or ("right" in seams and x + r > x1 - 2):
+            continue
+        out.append((x, y, r, score))
+    return out
+
+
 def yolo_balls(img: np.ndarray, H: np.ndarray) -> list[tuple] | None:
     """
     Balls from the trained model, in find_balls' format but full-resolution px:
     [(table x, table y, x, y, r)]. None when the model is off or fails, so the caller
     falls back to find_balls.
+
+    The whole table shrunk to the model's input leaves a far ball ~17 px wide, too small
+    to split touching balls (a rack). So it also runs on the left and right halves (a bit
+    of overlap), where balls are twice the size. The full view goes first; a half's ball
+    is new only if no ball already kept is within YOLO_SAME_BALL_PASSES radii.
+    Duplicates are judged in the photo, where touching balls are two radii apart.
     """
     net = _yolo_model()
     if net is None:
         return None
+    x0, y0, x1, y1 = table_crop(img, H)
+    half = int((x1 - x0) / 2 * (1 + YOLO_TILE_OVERLAP))
     try:
-        x0, y0, x1, y1 = table_crop(img, H)
-        square, k, left, top = _letterbox(img[y0:y1, x0:x1], YOLO_SIZE)
-        net.setInput(cv2.dnn.blobFromImage(square, 1 / 255.0, swapRB=True))
-        boxes = decode_yolo(net.forward())
+        passes = [_yolo_pass(net, img, (x0, y0, x1, y1)),
+                  _yolo_pass(net, img, (x0, y0, x0 + half, y1), ("right",)),
+                  _yolo_pass(net, img, (x1 - half, y0, x1, y1), ("left",))]
     except cv2.error as e:
         log.warning("YOLO ball detection failed, using circles: %s", e)
         return None
     found = []
-    for bx, by, bw, bh, _ in sorted(boxes, key=lambda b: -b[4]):
-        cx, cy = (bx - left) / k + x0, (by - top) / k + y0
-        tx, ty = cv2.perspectiveTransform(np.float32([[[cx, cy]]]), H)[0, 0]
-        edge = 0.5 * BALL_RADIUS                      # same limits as find_balls
-        if not (edge < tx < TABLE_W - edge and edge < ty < TABLE_H - edge):
-            continue
-        if any(np.hypot(tx - f[0], ty - f[1]) < 1.8 * BALL_RADIUS for f in found):
-            continue
-        found.append((float(tx), float(ty), cx, cy, (bw + bh) / 4 / k))
+    edge = 0.5 * BALL_RADIUS                          # same limits as find_balls
+    for n, boxes in enumerate(passes):
+        same = YOLO_SAME_BALL if n == 0 else YOLO_SAME_BALL_PASSES
+        for x, y, r, _ in sorted(boxes, key=lambda b: -b[3]):
+            tx, ty = cv2.perspectiveTransform(np.float32([[[x, y]]]), H)[0, 0]
+            if not (edge < tx < TABLE_W - edge and edge < ty < TABLE_H - edge):
+                continue
+            if any(math.hypot(x - f[2], y - f[3]) < same * max(r, f[4]) for f in found):
+                continue
+            found.append((float(tx), float(ty), float(x), float(y), float(r)))
     return found
 
 

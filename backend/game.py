@@ -39,6 +39,8 @@ STRIPES = tuple(range(9, 16))
 # anything costing more than MATCH_MAX_COST is treated as a false detection.
 MATCH_MAX_COST = 1.6
 MOVE_SCALE = 300          # table units; a ball this far from its last spot costs +0.5
+STAYED = 16               # table units: a detection this close to where a ball was is that ball...
+STAYED_BONUS = 0.3        # ...preferred by this much, whatever vision thinks it looks like
 FLAG_COST = 0.6           # matches costlier than this get flagged for the user to confirm
 REVIVE_CONFIDENCE = 0.7   # how sure vision must be of a pocketed ball's number to bring it back
 UNSEEN_COST = 0.25        # position cost for a ball we have never seen yet
@@ -111,6 +113,12 @@ def _cost(det: dict, bid: str, ball: dict) -> float:
         cost += -0.4 if det["id"] == int(bid) else 0.3 * det["confidence"]
     if ball["x"] is not None:
         moved = math.hypot(det["x"] - ball["x"], det["y"] - ball["y"])
+        if moved < STAYED:
+            # Right where this ball was: most balls don't move in a shot, and from above a
+            # stripe with its band underneath looks exactly like the cue ball. Where a ball
+            # sits beats what vision thinks it looks like (otherwise, after a scratch, a
+            # white-looking stripe gets taken for the cue and the stripe "goes missing").
+            return 0.3 * max(cost, 0.0) - STAYED_BONUS
         cost += 0.5 * min(1.0, moved / MOVE_SCALE)
     else:
         # Never seen: it could be anywhere, so it costs as much as a ball that moved

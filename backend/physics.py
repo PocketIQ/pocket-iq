@@ -180,9 +180,13 @@ class Shot:
 
 
 def find_shots(balls: list[dict], group: str | None, *, cue: tuple | None = None,
-               banks: bool = True, W: float = TABLE_W, H: float = TABLE_H) -> list[Shot]:
+               banks: bool = True, relaxed: bool = False,
+               W: float = TABLE_W, H: float = TABLE_H) -> list[Shot]:
     """All makeable shots at a legal ball, easiest first (port of findShots).
-    `cue` overrides the cue ball position (used to score the NEXT shot)."""
+    `cue` overrides the cue ball position (used to score the NEXT shot).
+    `relaxed`: also the shots shots.ts would offer that these rules leave out (aimed at the
+    pocket's corner point, banks off a pocket opening, paths over another pocket), so a
+    shot the frontend picked can still be planned (or shown to be unmakeable)."""
     cue_i = next((i for i, b in enumerate(balls) if b["type"] == "cue"), None)
     if cue is None:
         if cue_i is None:
@@ -209,7 +213,7 @@ def find_shots(balls: list[dict], group: str | None, *, cue: tuple | None = None
         legs = [(target, bank), (bank, drop)] if bank else [(target, drop)]
         if not all(_clear(a, b, balls, skip) for a, b in legs):
             return False
-        if any(_passes_pocket(a, b, pocket, W, H) for a, b in legs):
+        if not relaxed and any(_passes_pocket(a, b, pocket, W, H) for a, b in legs):
             return False
         travel = _len(_sub(ghost, cue)) + sum(_len(_sub(b, a)) for a, b in legs)
         difficulty = (0.55 * (cut / 75) ** 1.5 + 0.3 * travel / diag
@@ -222,10 +226,10 @@ def find_shots(balls: list[dict], group: str | None, *, cue: tuple | None = None
         target = (balls[ti]["x"], balls[ti]["y"])
         for p in pockets(W, H):
             # Through the middle of the opening if that works, else off to one side.
-            any(try_shot(ti, target, p, drop, None, drop, off) for drop, off in p.aims())
+            aims = p.aims() + ([((p.x, p.y), 1.0)] if relaxed else [])   # shots.ts aims at the corner
+            any(try_shot(ti, target, p, drop, None, drop, off) for drop, off in aims)
             if not banks:
                 continue
-            pp = p.mouth
             cushions = [
                 (lambda q: (q[0], 2 * R - q[1]), lambda a, b: _cross_y(a, b, R)),
                 (lambda q: (q[0], 2 * (H - R) - q[1]), lambda a, b: _cross_y(a, b, H - R)),
@@ -233,15 +237,18 @@ def find_shots(balls: list[dict], group: str | None, *, cue: tuple | None = None
                 (lambda q: (2 * (W - R) - q[0], q[1]), lambda a, b: _cross_x(a, b, W - R)),
             ]
             for mirror, hit in cushions:
-                m = mirror(pp)
-                if _len(_sub(m, pp)) < 4 * R:
-                    continue
-                bank = hit(target, m)
-                if not bank or not (R <= bank[0] <= W - R and R <= bank[1] <= H - R):
-                    continue
-                if _bank_in_pocket(bank, W, H):
-                    continue
-                try_shot(ti, target, p, m, bank, pp, 0.0)
+                # Into the mouth; shots.ts mirrors the pocket's corner point instead.
+                for pp in [p.mouth] + ([(p.x, p.y)] if relaxed else []):
+                    m = mirror(pp)
+                    if _len(_sub(m, pp)) < 4 * R:
+                        continue
+                    bank = hit(target, m)
+                    if not bank or not (R <= bank[0] <= W - R and R <= bank[1] <= H - R):
+                        continue
+                    if not relaxed and _bank_in_pocket(bank, W, H):
+                        continue
+                    if try_shot(ti, target, p, m, bank, pp, 0.0):
+                        break
     return sorted(shots, key=lambda s: s.difficulty)
 
 
@@ -644,9 +651,26 @@ def balls_from_state(state: dict) -> list[dict]:
 
 def match_shot(balls: list[dict], group: str | None, target_id: int, pocket: str, kind: str,
                cut_angle: float | None = None) -> Shot | None:
-    """Find the geometry for a candidate the frontend described (target, pocket, kind)."""
-    found = [s for s in find_shots(balls, group)
-             if s.target_id == target_id and s.pocket.name == pocket and s.kind == kind]
-    if not found:
-        return None
-    return min(found, key=lambda s: abs(s.cut - cut_angle)) if cut_angle is not None else found[0]
+    """Find the geometry for a candidate the frontend described (target, pocket, kind).
+    Its shot finder (shots.ts) is a little looser than find_shots, so if this one doesn't
+    list the shot, look again with relaxed rules rather than refuse it."""
+    for relaxed in (False, True):
+        found = [s for s in find_shots(balls, group, relaxed=relaxed)
+                 if s.target_id == target_id and s.pocket.name == pocket and s.kind == kind]
+        if found:
+            return min(found, key=lambda s: abs(s.cut - cut_angle)) if cut_angle is not None else found[0]
+    return None
+
+
+def why_not(balls: list[dict], shot: Shot) -> str:
+    """Why no power and spin pockets this shot, in words for the player."""
+    if shot.bank and _bank_in_pocket(shot.bank):
+        return "The bank point is in a pocket opening, so the ball would drop there instead of banking."
+    target = (balls[shot.target_index]["x"], balls[shot.target_index]["y"])
+    legs = [(target, shot.bank), (shot.bank, shot.pocket.mouth)] if shot.bank else [(target, shot.pocket.mouth)]
+    for pk in pockets():
+        if pk.name != shot.pocket.name and any(
+                dist_to_segment((pk.x, pk.y), a, b) < (SIDE_CAPTURE if pk.side else CORNER_CAPTURE)
+                for a, b in legs):
+            return f"The ball would drop in the {pk.name.replace('_', ' ')} pocket on the way."
+    return "No power and spin we tried drops it cleanly: try another shot."

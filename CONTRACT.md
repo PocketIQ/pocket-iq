@@ -54,7 +54,10 @@ needed. The next shot is the break: the table stays open whatever goes in, and a
 on the break is spotted (`"spotted": [8]` in the event; put it back on the foot spot
 before the next photo).
 
-**Scratch → ball in hand.** After a scratch, `Game.ball_in_hand` is true: the next
+**Scratch → ball in hand.** Take the photo with the cue ball still in the pocket (don't
+fish it out first, or it looks like it never went in). After a scratch, `Game.ball_in_hand`
+is true and the layout has no cue ball, so `shots.ts` finds nothing: show the coach's or
+`/plan/ball-in-hand`'s spot instead. The next
 player places the cue ball anywhere. Ask the coach (`/advice`, which then says where to
 place it) or `POST /plan/ball-in-hand`. It goes back to false once a photo shows the cue
 ball on the table, or the next shot is played. Shooting straight from hand without a
@@ -220,17 +223,20 @@ for the spin indicator and power bar of whichever shot is selected.
 {"balls": [{"id": null, "type": "cue", "x": 250, "y": 250}, {"id": 12, "type": "stripe", "x": 380, "y": 140}],
  "group": null, "target_id": 12, "pocket": "top_side", "kind": "direct", "cut_angle": 11}
 ```
-Response: `{"physics": <the advice physics object, planned: true>, "speed": "medium", "spin_name": "follow"}`.
-`physics` (and the words) are null if no power and spin tried pockets the ball. 409 if
-there's no cue ball or that shot isn't open from this layout.
+Response: `{"physics": <the advice physics object, planned: true>, "speed": "medium", "spin_name": "follow", "reason": null}`.
+`physics` (and the words) are null if no power and spin tried pockets the ball; then
+`reason` says why in words (e.g. "The ball would drop in the top side pocket on the way.").
+Any shot `shots.ts` offers is accepted (its rules are a little looser than the backend's):
+409 only if there's no cue ball, or no such shot exists from this layout at all.
 
 The backend aims balls at the middle of each pocket's opening (or to one side of it, when
 the middle is blocked or a ball is frozen on the rail), not at the pocket's corner point
 like `shots.ts`. It also leaves out shots that can't work: banks off a pocket opening,
 and balls rolled along a rail past another pocket (they drop there). So its cut angles can
-differ from `shots.ts` by a few degrees, and a few `shots.ts` shots get a 409 here.
-`shots.ts` could adopt the same rules (`Pocket.aims`, `_bank_in_pocket`, `_passes_pocket`
-in `backend/physics.py`).
+differ from `shots.ts` by a few degrees. A `shots.ts` shot those rules leave out still
+gets planned, or `physics: null` with a `reason` if it can't work. `shots.ts` could adopt
+the same rules (`Pocket.aims`, `_bank_in_pocket`, `_passes_pocket` in `backend/physics.py`)
+so it stops offering those.
 
 `POST /plan/ball-in-hand` → after a scratch: where to put the cue ball, and the shot and
 plan from there. Physics only, like `/plan`.

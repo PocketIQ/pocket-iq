@@ -340,9 +340,9 @@ def plan_shot(body: PlanRequest):
         raise HTTPException(409, "That shot isn't open from this layout.")
     p = physics.plan(balls, shot, body.group)
     if p is None:
-        return {"physics": None, "speed": None, "spin_name": None}
+        return {"physics": None, "speed": None, "spin_name": None, "reason": physics.why_not(balls, shot)}
     return {"physics": physics.plan_json(p), "speed": physics.speed_word(p.power),
-            "spin_name": physics.spin_word(p.spin)}
+            "spin_name": physics.spin_word(p.spin), "reason": None}
 
 
 class HandRequest(BaseModel):
