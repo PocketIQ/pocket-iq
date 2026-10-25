@@ -66,7 +66,10 @@ function MenuItem({ label, detail, onClick }: { label: string; detail?: string; 
 }
 
 /** App bar: name, New game, and the menu (profile, how to rack). */
-export function Banner({ onNewGame }: { onNewGame?: () => void }) {
+export function Banner({ onNewGame, onShowTestTools }: {
+  onNewGame?: () => void
+  onShowTestTools?: () => void // dev only, while the test table buttons are hidden
+}) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [sheet, setSheet] = useState<'profile' | 'rack' | null>(null)
 
@@ -114,6 +117,16 @@ export function Banner({ onNewGame }: { onNewGame?: () => void }) {
               >
                 <MenuItem label="Profile" detail="Guest" onClick={() => open('profile')} />
                 <MenuItem label="How to rack" onClick={() => open('rack')} />
+                {onShowTestTools && (
+                  <MenuItem
+                    label="Show test tools"
+                    detail="dev"
+                    onClick={() => {
+                      setMenuOpen(false)
+                      onShowTestTools()
+                    }}
+                  />
+                )}
               </div>
             </>
           )}

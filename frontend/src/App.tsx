@@ -35,6 +35,15 @@ const SHOTS_SHOWN = 3
 const SHOTS_TO_COACH = 8
 
 const DEV_GAME_ID = 'dev' // the test table's local game: no backend
+const TEST_TOOLS_KEY = 'cueiq.testTools' // "hidden" = the test table buttons are tucked away
+
+function testToolsHidden(): boolean {
+  try {
+    return localStorage.getItem(TEST_TOOLS_KEY) === 'hidden'
+  } catch {
+    return false
+  }
+}
 
 function errorMessage(err: unknown): string {
   return err instanceof TypeError
@@ -293,6 +302,7 @@ export default function App() {
   // Physics plan (spin and power) and the shot it's for: a stale one is simply not shown.
   const [plan, setPlan] = useState<{ shot: Shot; result: PlanResponse | null } | null>(null)
   const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
+  const [hideTestTools, setHideTestTools] = useState(testToolsHidden)
   const [placing, setPlacing] = useState<number | null>(null) // ball taken out of the gutter, to put on the table
 
   const busy = status.kind === 'loading'
@@ -562,6 +572,16 @@ export default function App() {
     }
   }
 
+  function showTestTools(show: boolean) {
+    setHideTestTools(!show)
+    try {
+      if (show) localStorage.removeItem(TEST_TOOLS_KEY)
+      else localStorage.setItem(TEST_TOOLS_KEY, 'hidden')
+    } catch {
+      /* hidden until the next reload, then */
+    }
+  }
+
   function newGame() {
     try {
       localStorage.removeItem(GAME_KEY)
@@ -606,7 +626,10 @@ export default function App() {
 
   return (
     <main className="min-h-dvh bg-stone-100 text-stone-900 dark:bg-stone-950 dark:text-stone-100">
-      <Banner onNewGame={game ? newGame : undefined} />
+      <Banner
+        onNewGame={game ? newGame : undefined}
+        onShowTestTools={import.meta.env.DEV && hideTestTools ? () => showTestTools(true) : undefined}
+      />
       <div className="mx-auto max-w-2xl px-4 py-5 flex flex-col gap-5">
         <h1 className="sr-only">PocketIQ</h1>
         <p className="-mb-2 text-sm text-stone-600 dark:text-stone-400">
@@ -622,8 +645,8 @@ export default function App() {
         {!game && <Setup onStart={start} busy={busy} />}
 
         {/* Dev only: skip the camera + backend and load a canned table */}
-        {import.meta.env.DEV && (
-          <div className="grid grid-cols-2 gap-2">
+        {import.meta.env.DEV && !hideTestTools && (
+          <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
             {[false, true].map(teams => (
               <button
                 key={String(teams)}
@@ -634,6 +657,17 @@ export default function App() {
                 {teams ? 'Test table (teams)' : 'Load test table'}
               </button>
             ))}
+            {/* Bring them back from the menu */}
+            <button
+              type="button"
+              aria-label="Hide test tools"
+              onClick={() => showTestTools(false)}
+              className="flex size-10 items-center justify-center self-center rounded-lg text-stone-500 active:bg-stone-200 dark:active:bg-stone-800"
+            >
+              <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                <path d="M6 6l12 12M18 6 6 18" />
+              </svg>
+            </button>
           </div>
         )}
 
