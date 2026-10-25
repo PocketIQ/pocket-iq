@@ -110,10 +110,57 @@ function drawShot(ctx: CanvasRenderingContext2D, shot: Shot, r: number, active: 
   ctx.globalAlpha = 1
 }
 
+/** Where the line from the cue ball through the ghost ball meets the cushion (felt edge). */
+function aimAtCushion(shot: Shot, W: number, H: number): Vec | null {
+  const cue = shot.cuePath[0]
+  const g = shot.ghost
+  const dx = g.x - cue.x
+  const dy = g.y - cue.y
+  if (!dx && !dy) return null
+  const tx = dx > 0 ? (W - g.x) / dx : dx < 0 ? -g.x / dx : Infinity
+  const ty = dy > 0 ? (H - g.y) / dy : dy < 0 ? -g.y / dy : Infinity
+  const t = Math.min(tx, ty)
+  return { x: g.x + dx * t, y: g.y + dy * t }
+}
+
+/** The aiming line: straight on from the ghost ball to the cushion, grey dots, with a
+ * mark on the cushion. Line the cue up with that spot on the rail. */
+function drawAimLine(ctx: CanvasRenderingContext2D, shot: Shot, W: number, H: number) {
+  const end = aimAtCushion(shot, W, H)
+  if (!end) return
+  ctx.strokeStyle = 'rgba(200,204,210,0.95)'
+  ctx.fillStyle = 'rgba(200,204,210,0.95)'
+  ctx.lineCap = 'round'
+  ctx.lineWidth = 3.5
+  ctx.setLineDash([0.1, 9]) // round caps on near-zero dashes draw dots
+  polyline(ctx, [shot.ghost, end])
+  ctx.setLineDash([])
+  ctx.beginPath()
+  ctx.arc(end.x, end.y, 6, 0, Math.PI * 2)
+  ctx.fill()
+}
+
+/** Where the cue ball goes after contact (physics plan): faint white dashes, and a faint
+ * ring where it stops. */
+function drawCueAfter(ctx: CanvasRenderingContext2D, path: Vec[], r: number) {
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)'
+  ctx.lineCap = 'round'
+  ctx.lineWidth = 2
+  ctx.setLineDash([7, 6])
+  polyline(ctx, path)
+  const end = path[path.length - 1]
+  ctx.setLineDash([3, 4])
+  ctx.beginPath()
+  ctx.arc(end.x, end.y, r, 0, Math.PI * 2)
+  ctx.stroke()
+  ctx.setLineDash([])
+}
+
 export function TableCanvas({
   data,
   shots = [],
   selected = 0,
+  cueAfter = null,
   showConfidence = true,
   highlight = null,
   onBallTap,
@@ -123,6 +170,8 @@ export function TableCanvas({
   data: AnalyzeResponse
   shots?: Shot[]
   selected?: number
+  /** The selected shot's cue ball path after contact (from the physics plan), if known. */
+  cueAfter?: Vec[] | null
   showConfidence?: boolean
   /** Index of a ball to ring, e.g. the one the ball picker is open for. */
   highlight?: number | null
@@ -242,6 +291,8 @@ export function TableCanvas({
       // Shot lines go under the balls. Faded alternatives first, chosen shot on top.
       shots.forEach((sh, i) => i !== selected && drawShot(ctx, sh, r, false))
       if (shots[selected]) drawShot(ctx, shots[selected], r, true)
+      if (shots[selected] && cueAfter && cueAfter.length > 1) drawCueAfter(ctx, cueAfter, r)
+      if (shots[selected]) drawAimLine(ctx, shots[selected], TW, TH)
 
       // Balls
       for (const b of data.balls) {
@@ -296,7 +347,7 @@ export function TableCanvas({
     const observer = new ResizeObserver(draw)
     observer.observe(canvas)
     return () => observer.disconnect()
-  }, [data, shots, selected, showConfidence, highlight])
+  }, [data, shots, selected, cueAfter, showConfidence, highlight])
 
   return (
     <canvas

@@ -353,6 +353,19 @@ export default function App() {
     }
   }, [view, selectedShot, shooterGroup])
 
+  // Where the cue ball goes after hitting the selected shot's ball, from its physics plan:
+  // the plan's path from the point nearest the ghost ball on (its start is the cue ball).
+  const cueAfter = useMemo(() => {
+    const path = plan && plan.shot === selectedShot ? plan.result?.physics?.cue_path : null
+    if (!path || !selectedShot) return null
+    const g = selectedShot.ghost
+    let contact = 0
+    path.forEach((p, i) => {
+      if (Math.hypot(p.x - g.x, p.y - g.y) < Math.hypot(path[contact].x - g.x, path[contact].y - g.y)) contact = i
+    })
+    return [g, ...path.slice(contact + 1)]
+  }, [plan, selectedShot])
+
   // Top shots, plus the coach's pick if it isn't one of them.
   const shown = shots.slice(0, SHOTS_SHOWN).map((_, i) => i)
   if (selected >= SHOTS_SHOWN && shots[selected]) shown.push(selected)
@@ -744,6 +757,7 @@ export default function App() {
                       data={view}
                       shots={shown.map(i => shots[i])}
                       selected={shown.indexOf(selected)}
+                      cueAfter={cueAfter}
                       showConfidence={!confirmed}
                       highlight={picking}
                       onBallTap={confirmed ? undefined : onBallTap}
