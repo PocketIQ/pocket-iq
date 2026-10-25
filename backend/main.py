@@ -1,4 +1,5 @@
 """CueIQ backend. Photo in, balls out; plus game memory and the coach (see CONTRACT.md)."""
+import copy
 import os
 
 from dotenv import load_dotenv
@@ -118,6 +119,7 @@ class LayoutBall(BaseModel):
 class Layout(BaseModel):
     balls: list[LayoutBall] = Field(max_length=16)
     intended: Intended | None = None
+    new: bool = False   # a previewed new photo being confirmed, not a fix to the latest one
 
 
 class GutterBall(BaseModel):
@@ -225,9 +227,10 @@ async def analyze_in_game(
     disappeared went in, a missing cue ball is a scratch. That shot is applied to the
     game (turns, groups, winner) and returned as `shot`.
     `intended`: JSON of the shot the player went for (makes their stats count it).
-    `retake`: this photo replaces the latest one instead of following it. It's only a
-    preview: nothing is saved, `game` is the game as it was before the photo being
-    retaken, and `pending` is true. Confirming the layout (PUT /layout) applies it.
+    `retake`: this photo replaces the latest one instead of following it.
+    Nothing is saved: it's a preview (`pending` is true) and `game` is what the game would
+    be with this photo. Confirming the layout applies it: PUT /layout with `new` true for a
+    new photo, false for a retake. Retake as often as needed before that.
     """
     state = _load(game_id)
     try:
@@ -238,38 +241,45 @@ async def analyze_in_game(
     # balls in play hid a ball that one bad photo had wrongly marked pocketed: this way
     # it's seen again and brought back (game.revive).
     balls, not_balls = _vision(await _read_photo(photo))
+    # Worked out on a copy: a bad photo mustn't change the game before the player checks it
+    trial = copy.deepcopy(state)
     try:
         if retake:
-            preview = game.preview_retake(state, balls, intended=meant)
+            result = game.replace_photo(trial, balls, intended=meant)
         else:
-            result = game.process_photo(state, balls, intended=meant)
+            result = game.process_photo(trial, balls, intended=meant)
     except game.GameError as e:
         raise HTTPException(409, str(e))
-    if retake:   # a bad photo shouldn't change the game until the player checks the retake
-        return {
-            "table": {"width": TABLE_W, "height": TABLE_H},
-            "ball_radius": BALL_RADIUS,
-            "balls": preview["balls"],
-            "missing": preview["missing"],
-            "rejected": preview["rejected"] + list(not_balls),
-            "shot": preview["shot"],
-            "game": game.public(preview["before"]),
-            "pending": True,
-        }
-    return _photo_result(state, result, not_balls)
+    return {
+        "table": {"width": TABLE_W, "height": TABLE_H},
+        "ball_radius": BALL_RADIUS,
+        "balls": result["balls"],
+        "missing": result["missing"],
+        "rejected": result["rejected"] + list(not_balls),
+        "revived": result.get("revived", []),
+        "shot": result["shot"],
+        "game": game.public(trial),
+        "pending": True,
+    }
 
 
 @app.put("/games/{game_id}/layout")
 def correct_layout(game_id: str, body: Layout):
     """
-    The player fixed the latest photo's layout (moved, relabeled, added or removed balls).
-    The game rewinds to before that photo and replays it with this layout, so the shot
-    it showed (what went in, scratch, whose turn) is recomputed from the corrected balls.
+    The player confirmed a layout. `new`: it's the photo they just took (previewed by
+    /analyze, not saved yet), applied now as the next photo. Otherwise it fixes the latest
+    photo (or confirms a retake of it): the game rewinds to before that photo and replays
+    it with this layout, so the shot it showed (what went in, scratch, whose turn) is
+    recomputed from the corrected balls.
     """
     state = _load(game_id)
+    balls = [b.model_dump() for b in body.balls]
+    meant = body.intended and body.intended.model_dump()
     try:
-        result = game.replace_photo(state, [b.model_dump() for b in body.balls], corrected=True,
-                                    intended=body.intended and body.intended.model_dump())
+        if body.new:
+            result = game.process_photo(state, balls, corrected=True, intended=meant)
+        else:
+            result = game.replace_photo(state, balls, corrected=True, intended=meant)
     except game.GameError as e:
         raise HTTPException(409, str(e))
     return _photo_result(state, result)

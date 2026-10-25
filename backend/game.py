@@ -318,20 +318,6 @@ def replace_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     return {**result, "undone": undone}
 
 
-def preview_retake(state: dict, detections: list[dict], *, intended: dict | None = None) -> dict:
-    """
-    A retake of the latest photo, NOT applied: the game is left as it is until the player
-    confirms the layout (PUT /layout replays the photo then). Returns what replace_photo
-    would ({balls, missing, rejected, shot}) plus `before`: the game as it was before the
-    photo being retaken, which is what the player should see while checking the retake.
-    """
-    if state["undo"] is None:
-        raise GameError("There's no photo to retake yet. Take a photo of the table first.")
-    trial = copy.deepcopy(state)
-    result = replace_photo(trial, detections, intended=intended)
-    return {**result, "before": copy.deepcopy(state["undo"])}
-
-
 def set_turn(state: dict, turn: int) -> None:
     """The player says whose turn it is (the photos got it wrong). Holds until the next photo."""
     if state["winner"] is not None:

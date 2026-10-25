@@ -35,6 +35,10 @@ const SHOTS_SHOWN = 3
 const SHOTS_TO_COACH = 8
 
 const DEV_GAME_ID = 'dev' // the test table's local game: no backend
+/** A photo not saved yet. `intended`: the shot they went for, sent when it's confirmed. */
+type Pending = { mode: 'new' | 'replace'; intended: IntendedShot | null }
+
+const NOTHING_HELD = { gutter: null, turn: null }
 const TEST_TOOLS_KEY = 'cueiq.testTools' // "hidden" = the test table buttons are tucked away
 
 function testToolsHidden(): boolean {
@@ -322,7 +326,10 @@ export default function App() {
   const [plan, setPlan] = useState<{ shot: Shot; result: PlanResponse | null } | null>(null)
   const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
   const [hideTestTools, setHideTestTools] = useState(testToolsHidden)
-  const [pendingRetake, setPendingRetake] = useState(false) // a retake shown but not applied until confirmed
+  // The photo just taken (new, or a retake of the latest): shown but not saved until confirmed
+  const [pending, setPending] = useState<Pending | null>(null)
+  // Gutter and turn fixes made while checking a retake: sent once confirming applies it
+  const [held, setHeld] = useState<{ gutter: GutterEntry[] | null; turn: 0 | 1 | null }>(NOTHING_HELD)
   const [placing, setPlacing] = useState<number | null>(null) // ball taken out of the gutter, to put on the table
 
   const busy = status.kind === 'loading'
@@ -414,7 +421,8 @@ export default function App() {
     setHistory(EMPTY_HISTORY)
     setPicking(null)
     setPlacing(null)
-    setPendingRetake(false)
+    setPending(null)
+    setHeld(NOTHING_HELD)
     setSelected(0)
     resetCoach()
   }
@@ -445,13 +453,11 @@ export default function App() {
   // the table, or puts one back. Unsaved layout edits are kept; the coach starts over.
   async function saveGutter(next: GutterEntry[], change?: TableChange) {
     if (!game || busy) return
-    if (pendingRetake) {
-      setStatus({ kind: 'error', message: 'Confirm the retaken photo first: until then the gutter is from before it.' })
-      return
-    }
     let saved: Ball[] | null = serverBalls && change ? changeTable(serverBalls, change) : serverBalls
-    if (devMode) {
+    // The test table has no backend, and a photo isn't saved until confirmed: both change it here only
+    if (devMode || pending) {
       setGame(withGutter(game, next))
+      if (pending) setHeld(h => ({ ...h, gutter: next }))
     } else {
       const res = await run('Saving the gutter…', () =>
         correctPocketed(game.id, next, change && saved ? toLayout(saved) : null),
@@ -498,40 +504,37 @@ export default function App() {
   }
 
   // Every photo after the first shows the result of the shot before it: the backend
-  // works out what went in by comparing it with the previous photo.
+  // works out what went in by comparing it with the previous photo. Nothing is saved until
+  // the layout is confirmed, so a bad photo can be retaken as often as needed.
   async function handlePhoto(file: File, retake: boolean) {
     if (!game) return
-    if (pendingRetake && !retake) {
-      setStatus({ kind: 'error', message: 'Confirm the retaken photo first (or retake it again).' })
-      return
-    }
-    // The shot selected on screen is the one they went for: it's what counts as made or
-    // missed in their stats. A retake keeps what was sent with the original photo.
+    // While a photo is waiting, any new one redoes it. Otherwise the shot selected on screen
+    // is the one they went for: it's what counts as made or missed in their stats. A retake
+    // of a saved photo keeps what was sent with it.
     const shot = shots[selected]
-    const intended: IntendedShot | null =
-      !retake && shot?.targetId != null
+    const next: Pending = pending ?? {
+      mode: retake ? 'replace' : 'new',
+      intended: !retake && shot?.targetId != null
         ? { target: shot.targetId, pocket: shot.pocket, kind: shot.kind, cut_angle: shot.cutAngle }
-        : null
+        : null,
+    }
     const res = await run('Reading the table…', async () =>
-      analyzeGamePhoto(game.id, await resizeImage(file), { intended, retake }),
+      analyzeGamePhoto(game.id, await resizeImage(file), { intended: next.intended, retake: next.mode === 'replace' }),
     )
     if (!res) return
-    // A retake comes back unapplied: the game as it was before the bad photo, until confirmed
-    setGame(res.game)
+    setGame(res.game) // what the game would be with this photo; the saved one hasn't changed
     loadView(res)
-    setPendingRetake(!!res.pending)
+    setPending(next)
   }
 
   // The photos got the turn wrong: the player switches it by hand.
   async function swapTurn() {
     if (!game || busy || game.winner != null) return
-    if (pendingRetake) {
-      setStatus({ kind: 'error', message: 'Confirm the retaken photo first.' })
-      return
-    }
     const turn = game.turn === 0 ? 1 : 0
-    if (devMode) setGame({ ...game, turn })
-    else {
+    if (devMode || pending) {
+      setGame({ ...game, turn })
+      if (pending) setHeld(h => ({ ...h, turn }))
+    } else {
       const g = await run('Switching turns…', () => setTurn(game.id, turn))
       if (!g) return
       setGame(g)
@@ -599,16 +602,23 @@ export default function App() {
     }
     let current = view
     let currentGame = game
-    // A retake is only applied now (the backend replays it in place of the bad photo)
-    if (!devMode && (view.balls !== serverBalls || pendingRetake)) {
-      const res = await run('Saving your fixes…', () => correctLayout(game.id, toLayout(view.balls)))
+    // A photo is only saved now: as the next one, or in place of the latest (a retake)
+    if (!devMode && (view.balls !== serverBalls || pending)) {
+      const res = await run('Saving your fixes…', async () => {
+        const out = await correctLayout(game.id, toLayout(view.balls), pending?.intended ?? null, pending?.mode === 'new')
+        // Then what they fixed while checking a retake, on top of the replayed photo
+        if (held.gutter) out.game = (await correctPocketed(game.id, held.gutter, null)).game
+        if (held.turn != null) out.game = await setTurn(game.id, held.turn)
+        return out
+      })
       if (!res) return
       current = res
       currentGame = res.game
       setGame(res.game)
       setView(res)
       setServerBalls(res.balls)
-      setPendingRetake(false)
+      setPending(null)
+      setHeld(NOTHING_HELD)
     }
     setStatus({ kind: 'idle' })
     setConfirmed(true)
@@ -741,15 +751,16 @@ export default function App() {
               swapDisabled={busy || game.winner != null}
             />
 
-            {pendingRetake ? (
-              <p className="rounded-lg bg-amber-100 px-4 py-3 text-sm text-amber-950 dark:bg-amber-950 dark:text-amber-100">
-                <span className="font-semibold">Retake:</span> the game is back to before the last photo. Check this
-                layout and confirm it to replace that photo; nothing changes until you do.
+            {pending && (
+              <p className="px-1 text-sm text-amber-700 dark:text-amber-300">
+                <span className="font-semibold">Not saved yet.</span> Check the table and gutter, retake if it’s
+                wrong, then confirm.
               </p>
-            ) : view?.shot ? (
+            )}
+            {view?.shot ? (
               <p className="px-1 text-sm">
-                <span className="font-semibold">Last shot:</span> {describeShot(view.shot)}.{' '}
-                <span className="text-stone-500">Wrong? Fix the layout or retake the photo.</span>
+                <span className="font-semibold">Last shot:</span> {describeShot(view.shot)}.
+                {!pending && <span className="text-stone-500"> Wrong? Fix the layout or retake the photo.</span>}
               </p>
             ) : (
               view &&
@@ -760,7 +771,8 @@ export default function App() {
               )
             )}
 
-            {game.winner != null ? (
+            {/* While a photo waits, the only photo button is Retake */}
+            {pending ? null : game.winner != null ? (
               <p className="rounded-xl bg-emerald-100 px-4 py-3 text-center text-lg font-semibold text-emerald-950 dark:bg-emerald-950 dark:text-emerald-100">
                 {game.players[game.winner].name} wins!
               </p>
@@ -776,14 +788,18 @@ export default function App() {
                 }
               />
             )}
-            {(photoCount > 0 || pendingRetake) && (
-              <PhotoButton disabled={busy} onFile={f => handlePhoto(f, true)} label="Retake the last photo" />
+            {(photoCount > 0 || pending) && (
+              <PhotoButton
+                disabled={busy}
+                onFile={f => handlePhoto(f, true)}
+                label={busy && pending && status.what === 'Reading the table…' ? status.what : pending ? 'Retake photo' : 'Retake the last photo'}
+              />
             )}
 
             {/* No table to show yet (or the game's over): the gutter goes where it would be */}
-            {!(view && game.winner == null) && gutterPanel()}
+            {!(view && (game.winner == null || pending)) && gutterPanel()}
 
-            {view && game.winner == null && (
+            {view && (game.winner == null || pending) && (
               <section className="flex flex-col gap-2">
                 {!confirmed && needsCheck > 0 && (
                   <p className="text-sm font-semibold text-amber-700 dark:text-amber-300">

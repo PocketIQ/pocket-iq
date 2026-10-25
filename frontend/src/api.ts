@@ -45,8 +45,9 @@ export const getGame = (id: string) => request<Game>(`/games/${id}`)
 
 /**
  * The next photo of the table. The backend compares it with the previous one to work out
- * the shot in between (what went in, scratch) and applies it. `intended`: the shot the
- * player went for. `retake`: replace the latest photo instead of following it.
+ * the shot in between (what went in, scratch), but saves nothing: the response is a
+ * preview (`pending`), saved by correctLayout once the player confirms it. `intended`: the
+ * shot the player went for. `retake`: replace the latest photo instead of following it.
  */
 export function analyzeGamePhoto(
   id: string,
@@ -59,11 +60,13 @@ export function analyzeGamePhoto(
 }
 
 /**
- * The player fixed the latest photo's layout. The backend replays that photo with these
- * balls, recomputing the shot it showed (what went in, whose turn). For the editor.
+ * The player confirmed a layout. `isNew`: it's the photo they just took (analyzed but not
+ * saved yet), saved now as the next photo. Otherwise it fixes the latest photo, or confirms
+ * a retake of it: the backend replays that photo with these balls, recomputing the shot it
+ * showed (what went in, whose turn).
  */
-export const correctLayout = (id: string, balls: LayoutBall[], intended: IntendedShot | null = null) => {
-  const init = json({ balls, intended })
+export const correctLayout = (id: string, balls: LayoutBall[], intended: IntendedShot | null = null, isNew = false) => {
+  const init = json({ balls, intended, new: isNew })
   return request<GameAnalyzeResponse>(`/games/${id}/layout`, { ...init, method: 'PUT' })
 }
 

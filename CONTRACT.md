@@ -117,9 +117,10 @@ default because it's slow) Gemini double-checks which number each ball is.
 optional `intended` (JSON string of the shot the player went for, e.g.
 `{"target": 2, "pocket": "top_left", "kind": "direct", "cut_angle": 18}`: makes their stats
 count it as made or missed) and `retake` (`"true"`: replace the latest photo instead of
-following it). A retake is only a preview: nothing is saved, `game` is the game as it was
-before the photo being retaken, and the response has `"pending": true`. Confirming the
-layout with `PUT /games/{id}/layout` applies it. Returns the `/analyze` response plus:
+following it). Nothing is saved: every photo is a preview (`"pending": true`) and `game`
+is what the game would be with it. The player checks it, retakes as often as needed, and
+confirming saves it with `PUT /games/{id}/layout` (`"new": true` for a new photo, false
+for a retake). Returns the `/analyze` response plus:
 ```json
 { "missing": ["4"], "rejected": [{"type": "solid", "id": 2, "x": 10, "y": 480, "confidence": 0.4}],
   "revived": [],
@@ -135,12 +136,14 @@ layout with `PUT /games/{id}/layout` applies it. Returns the `/analyze` response
   they're flagged (confidence ≤ 0.5) for the editor
 - `rejected`: detections that matched no ball in play (false detections), for debugging
 
-`PUT /games/{id}/layout`: the player corrected the latest photo (moved, relabeled, added
-or removed balls). Same response as `/analyze`, with `shot` recomputed.
+`PUT /games/{id}/layout`: the player confirmed a layout. With `"new": true` it's the photo
+they just previewed, saved now as the next photo. Otherwise it corrects the latest photo
+(moved, relabeled, added or removed balls) or confirms a retake of it: the game rewinds to
+before that photo and replays it. Same response as `/analyze` (saved, so no `pending`).
 ```json
 {"balls": [{"id": null, "type": "cue", "x": 400, "y": 300},
            {"id": 9, "x": 705, "y": 250}],
- "intended": null}
+ "intended": null, "new": false}
 ```
 - `balls`: EVERY ball on the table in the corrected layout. Identities are trusted as
   given. A ball left out that was in the previous photo counts as pocketed by this shot.
