@@ -50,9 +50,13 @@ Each photo is compared with the previous one:
 
 **The first photo is the racked table** (all 15 balls in the rack plus the cue ball, the
 whole table in frame, like every other photo). No separate close-up of the rack is
-needed. The next shot is the break: the table stays open whatever goes in, and an 8 made
-on the break is spotted (`"spotted": [8]` in the event; put it back on the foot spot
-before the next photo).
+needed. In that photo the 8 is always the ball in the middle of the rack's third row and
+the lone ball is the cue ball (vision's names for those two are corrected to fit). The
+next shot is the break: the table stays open whatever goes in. A shot only counts as the
+break if the photo before it shows the rack (a tight cluster of balls): if a game starts
+from a photo taken after the break, its first shot is an ordinary one and assigns groups
+as usual. An 8 made on the break is spotted (`"spotted": [8]` in the event; put it back on
+the foot spot before the next photo).
 
 **Scratch → ball in hand.** Take the photo with the cue ball still in the pocket (don't
 fish it out first, or it looks like it never went in). After a scratch, `Game.ball_in_hand`
@@ -164,7 +168,10 @@ latest photo, until the next photo. 409 once the game is over.
 - `balls` (optional): the latest photo's layout with that change made: a ball put in the
   gutter taken off it, one taken out of the gutter placed where it really is. Omit (null)
   when only who a ball counts for changed.
-- Turns, groups and the winner aren't recomputed. A later `PUT /layout` keeps the fix.
+- Turns and the winner aren't recomputed (`PUT /turn` fixes the turn). Groups are, while
+  the table is open: if the balls credited to each player are one group each (e.g. the
+  13 credited to the breaker, nothing to the other), those are their groups. A later
+  `PUT /layout` keeps the fix.
 - 409 if a ball is listed twice, or is both in `pocketed` and on the table
 
 `POST /games/{id}/advice` → which shot to take and how, for the player whose turn it is.

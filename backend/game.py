@@ -23,7 +23,8 @@ before that photo and replays it with the fixed layout (replace_photo), so a mis
 "pocketed" never sticks.
 
 The first photo is the racked table (all 15 balls plus the cue ball) and the next shot
-is the break. A scratch gives the other player ball in hand: `ball_in_hand` stays set
+is the break: a shot only counts as the break if the photo before it shows a rack. In that photo the 8 is the ball in the middle of the rack's third row and the
+lone ball is the cue ball, whatever vision thought (rack_prior). A scratch gives the other player ball in hand: `ball_in_hand` stays set
 until the cue ball shows up in a photo again or the next shot is played, and the coach
 places the cue ball (physics.ball_in_hand) instead of using its old spot.
 """
@@ -233,6 +234,63 @@ def place(state: dict, layout: list[dict]) -> dict:
     }
 
 
+RACK_MIN = 8               # balls in one tight cluster for a photo to count as the rack
+
+
+def _rack_cluster(pts: list[tuple]) -> list[int]:
+    """Indices of the rack: the balls within 120 units of the densest spot, if there are
+    at least RACK_MIN of them (a racked table); else []."""
+    if len(pts) < RACK_MIN:
+        return []
+    near = [sum(math.dist(p, q) < 60 for q in pts) for p in pts]
+    seed = pts[near.index(max(near))]
+    rack = [i for i, p in enumerate(pts) if math.dist(p, seed) < 120]
+    return rack if len(rack) >= RACK_MIN else []
+
+
+def rack_prior(detections: list[dict]) -> list[dict]:
+    """
+    The first photo is the racked table, so we know where some balls must be: the rack
+    is a tight triangle with its apex toward the middle of the table, the 8 sits in the
+    middle of its third row, and the lone ball away from it is the cue ball. Vision names
+    the rest from color (racks are in any order), but these two are fixed: if vision put
+    the "8" or "cue" name on a different ball, swap names. No-op if there's no rack.
+    """
+    dets = [dict(d) for d in detections]
+    pts = [(d["x"], d["y"]) for d in dets]
+    rack = _rack_cluster(pts)
+    if len(rack) < 10:
+        return dets
+    gaps = sorted(min(math.dist(pts[i], pts[j]) for j in rack if j != i) for i in rack)
+    spacing = gaps[len(gaps) // 2]                       # center to center, touching balls
+    cx = sum(pts[i][0] for i in rack) / len(rack)
+    cy = sum(pts[i][1] for i in rack) / len(rack)
+    corners = sorted(rack, key=lambda i: -math.dist(pts[i], (cx, cy)))[:3]
+    apex = pts[min(corners, key=lambda i: math.dist(pts[i], (500, 250)))]
+    axis = ((cx - apex[0]), (cy - apex[1]))
+    norm = math.hypot(*axis) or 1.0
+    eight_spot = (apex[0] + axis[0] / norm * math.sqrt(3) * spacing,
+                  apex[1] + axis[1] / norm * math.sqrt(3) * spacing)
+
+    def give(i: int, kind: str, number: int | None) -> None:
+        """Ball i gets this name; whoever had it takes ball i's old one."""
+        if (dets[i]["type"], dets[i].get("id")) == (kind, number):
+            return
+        holder = next((j for j, d in enumerate(dets) if (d["type"], d.get("id")) == (kind, number)), None)
+        if holder is not None:
+            dets[holder].update(type=dets[i]["type"], id=dets[i].get("id"),
+                                confidence=min(dets[holder]["confidence"], 0.5))
+        dets[i].update(type=kind, id=number, confidence=max(dets[i]["confidence"], 0.8))
+
+    eight = min(rack, key=lambda i: math.dist(pts[i], eight_spot))
+    if math.dist(pts[eight], eight_spot) < 0.6 * spacing:
+        give(eight, "eight", 8)
+    lone = [i for i in range(len(dets)) if i not in rack]
+    if len(lone) == 1:
+        give(lone[0], "cue", None)
+    return dets
+
+
 def _snapshot(state: dict) -> dict:
     return copy.deepcopy({k: v for k, v in state.items() if k != "undo"})
 
@@ -258,6 +316,8 @@ def process_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
               for b in live if state["balls"][b]["seen"]}
 
     in_hand = state.get("ball_in_hand", False)
+    if first and not corrected:
+        detections = rack_prior(detections)      # the opening photo is the rack
     seen = place(state, detections) if corrected else reconcile(state, detections)
     now = {b for b in live if state["balls"][b]["seen"]}
     gone = [b for b in before if b not in now]
@@ -274,8 +334,11 @@ def process_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     if not first and state["winner"] is None and (shot_taken or scratch):
         shooter = state["turn"]
         was_open = state["players"][shooter]["group"] is None
-        is_break = not state["history"]
-        shot = apply_shot(state, pocketed, scratch, intended)
+        # The break is the shot after a photo of the rack. Not just "the first shot": if
+        # the rack photo was skipped or failed, or a second photo of the same table came
+        # in, the first shot found would be an ordinary one wrongly kept open.
+        is_break = not state["history"] and bool(_rack_cluster(list(before.values())))
+        shot = apply_shot(state, pocketed, scratch, intended, is_break=is_break)
         shot["photo"] = state["photos"] + 1
         # What went in on the break counts for no one. An 8 spotted after the break is
         # back on the table, so it isn't in the gutter.
@@ -313,6 +376,7 @@ def replace_photo(state: dict, detections: list[dict], *, corrected: bool = Fals
     for e in gutter(state):
         if e["photo"] == state["photos"] and e["ball"] in fixed:
             e.update(by=fixed[e["ball"]]["by"], member=fixed[e["ball"]]["member"])
+    groups_from_gutter(state)
     if fixed_turn is not None and state["winner"] is None:
         state["turn"] = state["turn_fixed"] = fixed_turn
     return {**result, "undone": undone}
@@ -342,11 +406,12 @@ def set_turn(state: dict, turn: int) -> None:
 
 
 # ------------------------------------------------------------------ rules
-def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict | None = None) -> dict:
+def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict | None = None,
+               *, is_break: bool | None = None) -> dict:
     """
     Record the shot the current player just took (8-ball, simplified):
-    - the first shot of the game is the break: the table stays open whatever goes in,
-      and an 8 pocketed on the break is spotted (put back), not a loss
+    - the break (`is_break`; by default the game's first shot) leaves the table open
+      whatever goes in, and an 8 pocketed on the break is spotted (put back), not a loss
     - after that, the first shot that pockets only one group's balls assigns groups
     - pocketing the 8 wins only if your group was already cleared and you didn't scratch
     - you keep shooting if you pocketed one of yours (any object ball on an open table)
@@ -369,7 +434,8 @@ def apply_shot(state: dict, pocketed: list[int], scratch: bool, intended: dict |
     shooter = state["turn"]
     me, opp = state["players"][shooter], state["players"][1 - shooter]
     cleared_before = me["group"] is not None and not remaining(state, me["group"])
-    is_break = not state["history"]
+    if is_break is None:
+        is_break = not state["history"]
     spotted = is_break and 8 in pocketed
     for b in pocketed:
         if spotted and b == 8:
@@ -464,7 +530,8 @@ def set_gutter(state: dict, entries: list[dict], layout: list[dict] | None = Non
     The player fixed the gutter: these are exactly the pocketed balls (everything else is
     on the table), and who each one counts for. `layout`: the latest photo's balls with
     that change made (a ball put in the gutter taken off the table, one taken out of it
-    placed back on), like place(). Turns and groups aren't recomputed.
+    placed back on), like place(). Turns aren't recomputed (the player can swap the turn);
+    groups are, while the table is open: see groups_from_gutter.
     Also fixes the state a layout correction rewinds to, so a later correction keeps it:
     there, the balls the latest shot pocketed are left to the replay to find again.
     Returns {balls, missing, rejected} for the latest photo (empty before the first).
@@ -486,6 +553,7 @@ def set_gutter(state: dict, entries: list[dict], layout: list[dict] | None = Non
                 "photo": e.get("photo"), "open": bool(e.get("open"))} for e in entries]
     state["gutter"] = entries
     _sink_only(state, entries)
+    groups_from_gutter(state)
     seen = {"balls": [], "missing": [], "rejected": []}
     if layout is not None and state["photo"] is not None:
         seen = place(state, layout)
@@ -497,6 +565,28 @@ def set_gutter(state: dict, entries: list[dict], layout: list[dict] | None = Non
         before["gutter"] = [dict(e) for e in entries if e["photo"] != latest]
         _sink_only(before, before["gutter"])
     return seen
+
+
+def groups_from_gutter(state: dict) -> None:
+    """
+    While the table is open, the gutter can settle the groups: if the balls credited to
+    the players say one group each (player 0's are all solids, say, and player 1's none
+    or all stripes), that's their group. So crediting a ball pocketed on the break to the
+    breaker gives them its group, as the house rule would have. Mixed credits leave it open.
+    """
+    me, them = state["players"]
+    if me["group"] is not None or them["group"] is not None or state["winner"] is not None:
+        return
+    kinds = [set(), set()]
+    for e in gutter(state):
+        if e["by"] in (0, 1) and e["ball"] != 8:
+            kinds[e["by"]].add(ball_type(e["ball"]))
+    for p in (0, 1):
+        if len(kinds[p]) == 1 and kinds[1 - p] <= ({"solid", "stripe"} - kinds[p]):
+            g = next(iter(kinds[p]))
+            state["players"][p]["group"] = g
+            state["players"][1 - p]["group"] = "stripe" if g == "solid" else "solid"
+            return
 
 
 def public(state: dict) -> dict:
