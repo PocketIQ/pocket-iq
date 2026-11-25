@@ -40,7 +40,7 @@ export interface ShotEvent {
 export interface GutterEntry {
   ball: number // 1-15
   by: 0 | 1 | null // index into players it counts for; null = no one (the break, or not counted)
-  member: string | null // team mode: which teammate (the app sets it; the backend only knows sides)
+  member: string | null // team mode: which teammate (the app sets it; the game only knows sides)
   photo: number | null // the photo whose shot pocketed it; null = added by hand
   open: boolean // the table was still open, so it can't be the wrong group's ball
 }
@@ -62,8 +62,7 @@ export interface GameAnalyzeResponse extends AnalyzeResponse {
   rejected: Ball[] // detections that matched no ball still in play
   shot: ShotEvent | null // the shot this photo revealed; null for the first photo or no change
   game: Game
-  // A retake not applied yet: `game` is as it was before the photo being retaken, and
-  // confirming the layout (PUT /layout) applies it
+  // Not saved yet: `game` is what it would be with this photo. Confirming the layout saves it
   pending?: boolean
 }
 
@@ -82,60 +81,14 @@ export interface IntendedShot {
   cut_angle: number
 }
 
-export interface Candidate {
-  index: number
-  target_id: number
-  pocket: string
-  kind: 'direct' | 'bank'
-  cut_angle: number
-  difficulty: number
-  cue_distance: number
-  target_distance: number
-}
-
 /** Spin and power numbers (CONTRACT.md "Spin and power"). */
 export interface ShotPhysics {
-  planned: boolean // true: backend picked power/spin for position; false: a plain simulation
+  planned: boolean // true: power and spin were picked for position
   power: number // 0 (barely moving) .. 1 (hard break)
   spin: { x: number; y: number } // each -1..1; x: left/right english, y: draw (-) / follow (+)
   cue_path: { x: number; y: number }[] // cue ball start -> contact -> where it stops
   cue_stop: { x: number; y: number }
   object_path: { x: number; y: number }[]
   scratch: boolean
-  next_shot?: { target_ball: number; pocket: string; cut_angle: number } | null // advice only
-  made?: boolean // simulate only
-  kissed?: boolean // simulate only
-}
-
-export interface Advice {
-  shot_index: number // -1 = no good shot: play the safety described in `aim`
-  target_ball: number | null
-  pocket: string | null
-  aim: string
-  speed: 'soft' | 'medium' | 'firm' | 'hard'
-  spin: 'center' | 'follow' | 'draw' | 'stop' | 'left english' | 'right english'
-  cue_ball_after: string
-  why: string
-  tip: string
-  physics: ShotPhysics | null // null for a safety, or if the cue ball's position is unknown
-}
-
-interface Rate {
-  attempts: number
-  made: number
-  rate: number
-}
-
-export interface PlayerStats {
-  player: string
-  games: number
-  shots: number
-  attempts: number
-  made: number
-  make_rate: number | null
-  scratch_rate: number | null
-  by_cut_angle: Record<string, Rate>
-  by_kind: Record<string, Rate>
-  by_pocket: Record<string, Rate>
-  weekly: { week: string; attempts: number; rate: number }[]
+  next_shot?: { target_ball: number; pocket: string; cut_angle: number } | null
 }

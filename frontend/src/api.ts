@@ -1,79 +1,60 @@
-import type {
-  AnalyzeResponse,
-  Advice,
-  Candidate,
-  Game,
-  GameAnalyzeResponse,
-  GutterEntry,
-  IntendedShot,
-  LayoutBall,
-  PlayerStats,
-  ShotPhysics,
-} from './types'
+// What the app asks of the game. There's no server: saved games are in gameStore.ts, and
+// the rules, physics and photo reading run on the phone (engine/, backend/local.py).
+import { call, readPhoto } from './engine/engine'
+import { loadRecord, newRecord, saveRecord, type GameRecord } from './gameStore'
+import type { Game, GameAnalyzeResponse, GutterEntry, IntendedShot, LayoutBall, ShotPhysics } from './types'
 
-export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, init)
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    // FastAPI validation errors put a list in `detail`; ours put a string.
-    const detail = Array.isArray(body?.detail) ? body.detail[0]?.msg : body?.detail
-    throw new Error(detail ?? `Server returned ${res.status}`)
-  }
-  return res.json()
+function record(id: string): GameRecord {
+  const r = loadRecord(id)
+  if (!r) throw new Error('That game isn’t on this phone. Start a new one.')
+  return r
 }
 
-const json = (body: unknown): RequestInit => ({
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify(body),
-})
+/** What Python needs of a game. */
+const sent = ({ id, players, state }: GameRecord) => ({ id, players, state })
 
-function photoForm(photo: Blob, fields: Record<string, string> = {}): RequestInit {
-  const form = new FormData()
-  form.append('photo', photo, 'table.jpg') // field name must match FastAPI's `photo` param
-  for (const [k, v] of Object.entries(fields)) form.append(k, v)
-  return { method: 'POST', body: form }
+export function createGame(players: [string, string]): Game {
+  const r = newRecord(players)
+  saveRecord(r)
+  return r.game
 }
 
-export const analyzePhoto = (photo: Blob) => request<AnalyzeResponse>('/analyze', photoForm(photo))
-
-export const createGame = (players: [string, string]) => request<Game>('/games', json({ players }))
-
-export const getGame = (id: string) => request<Game>(`/games/${id}`)
+/** A saved game, or null if this phone doesn't have it. */
+export const getGame = (id: string): Game | null => loadRecord(id)?.game ?? null
 
 /**
- * The next photo of the table. The backend compares it with the previous one to work out
- * the shot in between (what went in, scratch), but saves nothing: the response is a
- * preview (`pending`), saved by correctLayout once the player confirms it. `intended`: the
- * shot the player went for. `retake`: replace the latest photo instead of following it.
+ * The next photo of the table. It's compared with the previous one to work out the shot in
+ * between (what went in, scratch), but nothing is saved: the response is a preview
+ * (`pending`), saved by correctLayout once the player confirms it. `intended`: the shot the
+ * player went for. `retake`: replace the latest photo instead of following it.
  */
-export function analyzeGamePhoto(
+export const analyzeGamePhoto = async (
   id: string,
-  photo: Blob,
+  photo: ImageData,
   { intended = null, retake = false }: { intended?: IntendedShot | null; retake?: boolean } = {},
-) {
-  const fields: Record<string, string> = { retake: String(retake) }
-  if (intended) fields.intended = JSON.stringify(intended)
-  return request<GameAnalyzeResponse>(`/games/${id}/analyze`, photoForm(photo, fields))
-}
+) => readPhoto<GameAnalyzeResponse>(photo, { record: sent(record(id)), intended, retake })
 
 /**
  * The player confirmed a layout. `isNew`: it's the photo they just took (analyzed but not
  * saved yet), saved now as the next photo. Otherwise it fixes the latest photo, or confirms
- * a retake of it: the backend replays that photo with these balls, recomputing the shot it
- * showed (what went in, whose turn).
+ * a retake of it: that photo is replayed with these balls, recomputing the shot it showed
+ * (what went in, whose turn).
  */
-export const correctLayout = (id: string, balls: LayoutBall[], intended: IntendedShot | null = null, isNew = false) => {
-  const init = json({ balls, intended, new: isNew })
-  return request<GameAnalyzeResponse>(`/games/${id}/layout`, { ...init, method: 'PUT' })
+export async function correctLayout(id: string, balls: LayoutBall[], intended: IntendedShot | null = null, isNew = false) {
+  const r = record(id)
+  const { state, view } = await call<{ state: unknown; view: GameAnalyzeResponse }>('layout', {
+    record: sent(r), balls, intended, new: isNew,
+  })
+  saveRecord({ ...r, state, game: view.game })
+  return view
 }
 
 /** The player says whose turn it is, when the photos got it wrong. Holds until the next photo. */
-export const setTurn = (id: string, turn: 0 | 1) => {
-  const init = json({ turn })
-  return request<Game>(`/games/${id}/turn`, { ...init, method: 'PUT' })
+export async function setTurn(id: string, turn: 0 | 1) {
+  const r = record(id)
+  const { state, game } = await call<{ state: unknown; game: Game }>('turn', { record: sent(r), turn })
+  saveRecord({ ...r, state, game })
+  return game
 }
 
 /**
@@ -81,46 +62,24 @@ export const setTurn = (id: string, turn: 0 | 1) => {
  * photo's layout with that change made (a ball put in the gutter taken off the table, one
  * taken out placed back on); null when the table didn't change.
  */
-export const correctPocketed = (id: string, pocketed: GutterEntry[], balls: LayoutBall[] | null) => {
-  const init = json({ pocketed, balls })
-  return request<GameAnalyzeResponse>(`/games/${id}/pocketed`, { ...init, method: 'PUT' })
+export async function correctPocketed(id: string, pocketed: GutterEntry[], balls: LayoutBall[] | null) {
+  const r = record(id)
+  const { state, view } = await call<{ state: unknown; view: GameAnalyzeResponse }>('pocketed', {
+    record: sent(r), pocketed, balls,
+  })
+  saveRecord({ ...r, state, game: view.game })
+  return view
 }
-
-export const getAdvice = (id: string, candidates: Candidate[]) =>
-  request<Advice>(`/games/${id}/advice`, json({ candidates }))
-
-/** MP3 of the latest advice read aloud. `nonce` busts the cache after new advice. */
-export const adviceAudioUrl = (id: string, nonce: number) => `${API_URL}/games/${id}/advice/audio?n=${nonce}`
-
-export const getStats = (name: string) => request<PlayerStats>(`/players/${encodeURIComponent(name)}/stats`)
-
-/**
- * What happens if the current player hits this shot with this power and spin: for
- * previewing the spin indicator and power bar live. The shot is one from findShots.
- */
-export const simulateShot = (
-  id: string,
-  shot: { target_id: number; pocket: string; kind: 'direct' | 'bank'; cut_angle?: number },
-  power: number,
-  spin: { x: number; y: number },
-) =>
-  request<ShotPhysics & { speed: Advice['speed']; spin_name: Advice['spin'] }>(
-    `/games/${id}/simulate`,
-    json({ ...shot, power, spin }),
-  )
 
 export interface PlanResponse {
   physics: ShotPhysics | null // null: no power and spin tried pockets this shot
-  speed: Advice['speed'] | null
-  spin_name: Advice['spin'] | null
+  speed: 'soft' | 'medium' | 'firm' | 'hard' | null
+  spin_name: string | null
 }
 
-/**
- * Physics only: the best power and spin for one shot from this layout. Needs no game,
- * database or Gemini, so it also works for the dev test table.
- */
+/** Physics only: the best power and spin for one shot from this layout. Needs no game. */
 export const planShot = (
   balls: { id: number | null; type: string; x: number; y: number }[],
   group: 'solid' | 'stripe' | null,
   shot: { target_id: number; pocket: string; kind: 'direct' | 'bank'; cut_angle?: number },
-) => request<PlanResponse>('/plan', json({ balls, group, ...shot }))
+) => call<PlanResponse>('plan', { balls, group, ...shot })

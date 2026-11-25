@@ -3,6 +3,22 @@
 Both sides code against this. Change it only together, and update
 `frontend/src/types.ts` in the same commit.
 
+## No server
+The app runs everything on the phone: `game.py`, `physics.py` and `vision.py` run in the
+browser (Pyodide), called through `backend/local.py` by `frontend/src/api.ts`. The shapes
+below are still what goes in and out (`Game`, the photo preview, the corrected layout, the
+gutter, `/plan`), and "saved" means saved on the phone (`frontend/src/gameStore.ts`).
+
+| Below | Now |
+|---|---|
+| `POST /games`, `GET /games/{id}` | `createGame`, `getGame` (no Python) |
+| `POST /games/{id}/analyze` | `analyzeGamePhoto` (`start_photo` ... `finish_photo`) |
+| `PUT /games/{id}/layout`, `/turn`, `/pocketed` | `layout`, `turn`, `pocketed` in `local.py` |
+| `POST /plan` | `plan` in `local.py` |
+
+The app doesn't use the rest (coach, voice, player stats, `/simulate`,
+`/plan/ball-in-hand`, plain `/analyze`): those only exist in the FastAPI server.
+
 ## Coordinate system
 - Table is always **1000 × 500** units (2:1, like a real table).
 - Origin (0,0) = top-left corner of the **felt** (inside the cushions).

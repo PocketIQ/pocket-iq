@@ -19,7 +19,7 @@ export function isWrong(game: Game, side: 0 | 1 | null, ball: number): boolean {
 }
 
 /**
- * The game's gutter (kept by the backend) ready to draw. In team mode, a ball nobody has
+ * The game's gutter ready to draw. In team mode, a ball nobody has
  * assigned a teammate to gets whoever took the shot that pocketed it (`byShot`, one per
  * history event). A ball pocketed while the table was open is never "wrong".
  */
@@ -35,7 +35,7 @@ export function gutterView(game: Game, byShot: (string | null)[]): GutterBall[] 
   })
 }
 
-/** What the backend does with a gutter fix, for the test table (which has no backend). */
+/** What the game does with a gutter fix, for the test table and photos not saved yet. */
 export function withGutter(game: Game, gutter: GutterEntry[]): Game {
   const sunk = new Set(gutter.map(e => String(e.ball)))
   const balls = Object.fromEntries(

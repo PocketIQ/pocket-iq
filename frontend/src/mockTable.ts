@@ -1,6 +1,6 @@
 import type { AnalyzeResponse, Game, ShotEvent } from './types'
 
-// Fake /analyze response for building the correction UI without taking photos. The 2, 7,
+// A made-up photo result for building the correction UI without taking photos. The 2, 7,
 // 13 and 15 are missing because MOCK_GAME's history pocketed them.
 // Includes a few deliberate mistakes to correct: low-confidence balls, a stripe
 // read as the 4, and a ghost ball to remove. Every ball has a number, like game photos.

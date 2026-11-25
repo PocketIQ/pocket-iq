@@ -12,7 +12,7 @@ export interface Guide {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
-/** The physics engine's plan for the selected shot (POST /plan). */
+/** The physics engine's plan for the selected shot. */
 export function guideFromPlan(plan: PlanResponse): Guide {
   if (!plan.physics) return placeholderGuide('No safe power found')
   const { spin, power } = plan.physics

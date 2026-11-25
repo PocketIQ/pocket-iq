@@ -1,30 +1,25 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { adviceAudioUrl, analyzeGamePhoto, correctLayout, correctPocketed, createGame, getAdvice, getGame, planShot, setTurn } from './api'
+import { useEffect, useMemo, useState } from 'react'
+import { analyzeGamePhoto, correctLayout, correctPocketed, createGame, getGame, planShot, setTurn } from './api'
 import type { PlanResponse } from './api'
 import { BallPicker } from './BallPicker'
 import { Banner } from './Banner'
 import { EditToolbar } from './EditToolbar'
+import { startEngine, useEngine } from './engine/engine'
 import { Gutter } from './Gutter'
 import { gutterView, withGutter } from './gutterBalls'
 import { MOCK_ROSTERS, MOCK_TABLE, mockGame } from './mockTable'
+import { offlineReady } from './offline'
+import { photoPixels } from './photoPixels'
 import { findShots, type Shot } from './physics/shots'
-import { resizeImage } from './resizeImage'
 import { Setup } from './Setup'
 import { ShotGuide } from './ShotGuide'
 import { guideFromPlan, placeholderGuide } from './spinPower'
 import { RAIL, TableCanvas } from './TableCanvas'
 import { loadRosters, saveRosters, SIDE_COLORS, teamTurns, type Rosters } from './teams'
 import type { Tool } from './EditToolbar'
-import type { Advice, Ball, Candidate, Game, GameAnalyzeResponse, GutterEntry, IntendedShot, LayoutBall, ShotEvent } from './types'
+import type { Ball, Game, GameAnalyzeResponse, GutterEntry, IntendedShot, LayoutBall, ShotEvent } from './types'
 
 type Status = { kind: 'idle' } | { kind: 'loading'; what: string } | { kind: 'error'; message: string }
-
-type Coach =
-  | { kind: 'idle' }
-  | { kind: 'loading' }
-  | { kind: 'done'; advice: Advice }
-  | { kind: 'error' }
-  | { kind: 'off' } // test table
 
 type History = { past: Ball[][]; future: Ball[][] }
 
@@ -32,9 +27,11 @@ const EMPTY_HISTORY: History = { past: [], future: [] }
 
 const GAME_KEY = 'cueiq.game' // resume the game after a reload
 const SHOTS_SHOWN = 3
-const SHOTS_TO_COACH = 8
+// Photo buttons open the camera. For testing without a table, ?upload lets phones pick a saved photo.
+const CAPTURE = new URLSearchParams(location.search).has('upload') ? undefined : 'environment'
+const READING = 'Reading the table…'
 
-const DEV_GAME_ID = 'dev' // the test table's local game: no backend
+const DEV_GAME_ID = 'dev' // the test table's game: never saved
 /** A photo not saved yet. `intended`: the shot they went for, sent when it's confirmed. */
 type Pending = { mode: 'new' | 'replace'; intended: IntendedShot | null }
 
@@ -49,33 +46,7 @@ function testToolsHidden(): boolean {
   }
 }
 
-function errorMessage(err: unknown): string {
-  return err instanceof TypeError
-    ? 'Couldn’t reach the server. Check that FastAPI is running and VITE_API_URL is right.'
-    : (err as Error).message
-}
-
-const pathLength = (pts: { x: number; y: number }[]) =>
-  pts.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - pts[i].x, p.y - pts[i].y), 0)
-
-function toCandidates(shots: Shot[]): Candidate[] {
-  return shots.slice(0, SHOTS_TO_COACH).flatMap((s, index) =>
-    s.targetId == null
-      ? []
-      : [{
-        index,
-        target_id: s.targetId,
-        pocket: s.pocket,
-        kind: s.kind,
-        cut_angle: s.cutAngle,
-        difficulty: s.difficulty,
-        cue_distance: Math.round(pathLength(s.cuePath)),
-        target_distance: Math.round(pathLength(s.targetPath)),
-      }],
-  )
-}
-
-/** What PUT /games/{id}/layout expects: identities only, the server derives types. */
+/** What confirming a layout sends: identities only, the game derives types. */
 const toLayout = (balls: Ball[]): LayoutBall[] =>
   balls.map(b => (b.type === 'cue' ? { id: null, type: 'cue', x: b.x, y: b.y } : { id: b.id, x: b.x, y: b.y }))
 
@@ -171,55 +142,6 @@ function Scoreboard({ game, up, onSwap, swapDisabled }: {
   )
 }
 
-function CoachCard({ advice, shot, audioUrl }: { advice: Advice; shot?: Shot; audioUrl: string }) {
-  const [voiceError, setVoiceError] = useState(false)
-  return (
-    <section className="flex flex-col gap-2 rounded-xl bg-white p-4 text-sm shadow-sm dark:bg-stone-900">
-      <h2 className="text-base font-semibold">
-        {advice.shot_index < 0 || !shot
-          ? 'No good shot: play safe'
-          : `The ${advice.target_ball} into the ${pocketName(advice.pocket ?? '')}`}
-      </h2>
-      <p>
-        <span className="font-medium">Aim:</span> {advice.aim}
-      </p>
-      <p className="flex flex-wrap gap-2">
-        <span className="rounded-full bg-stone-200 px-2 py-0.5 dark:bg-stone-800">speed: {advice.speed}</span>
-        <span className="rounded-full bg-stone-200 px-2 py-0.5 dark:bg-stone-800">spin: {advice.spin}</span>
-        {shot && <span className="rounded-full bg-stone-200 px-2 py-0.5 dark:bg-stone-800">cut {shot.cutAngle}°</span>}
-      </p>
-      <p>
-        <span className="font-medium">Cue ball after:</span> {advice.cue_ball_after}
-      </p>
-      <p className="text-stone-600 dark:text-stone-400">{advice.why}</p>
-      {advice.tip && <p className="rounded-lg bg-amber-100 px-3 py-2 text-amber-950 dark:bg-amber-950 dark:text-amber-100">{advice.tip}</p>}
-      {/* Read aloud by ElevenLabs, so the player can keep both hands on the cue */}
-      {voiceError ? (
-        <p className="text-xs text-stone-500">Voice isn’t available right now.</p>
-      ) : (
-        <audio controls autoPlay src={audioUrl} onError={() => setVoiceError(true)} className="w-full" />
-      )}
-      <p className="text-xs text-stone-500">Coached by Gemini, using this player’s shot history</p>
-    </section>
-  )
-}
-
-function CoachThinking() {
-  return (
-    <section role="status" className="flex flex-col gap-3 rounded-xl bg-white p-4 text-sm shadow-sm dark:bg-stone-900">
-      <p className="flex items-center gap-2 font-semibold">
-        <span className="size-4 animate-spin rounded-full border-2 border-emerald-600 border-t-transparent" aria-hidden="true" />
-        Coach is thinking…
-      </p>
-      <div className="flex animate-pulse flex-col gap-2" aria-hidden="true">
-        <div className="h-3 w-3/4 rounded bg-stone-200 dark:bg-stone-800" />
-        <div className="h-3 w-1/2 rounded bg-stone-200 dark:bg-stone-800" />
-        <div className="h-3 w-2/3 rounded bg-stone-200 dark:bg-stone-800" />
-      </div>
-    </section>
-  )
-}
-
 // After a reload, rebuild the table view from the game's latest photo.
 function viewFromLayout(game: Game): GameAnalyzeResponse | null {
   if (!game.layout) return null
@@ -246,7 +168,7 @@ function PhotoButton({ label, onFile, disabled, primary }: {
   primary?: boolean
 }) {
   return (
-    // capture="environment" opens the rear camera on phones; on laptops it's a file picker
+    // CAPTURE opens the rear camera on phones; on laptops it's a file picker
     <label
       className={`flex cursor-pointer items-center justify-center rounded-xl px-5 font-semibold focus-within:ring-4 focus-within:ring-emerald-400 ${
         primary
@@ -258,7 +180,7 @@ function PhotoButton({ label, onFile, disabled, primary }: {
       <input
         type="file"
         accept="image/*"
-        capture="environment"
+        capture={CAPTURE}
         className="sr-only"
         disabled={disabled}
         onChange={e => {
@@ -296,7 +218,7 @@ function CameraButton({ label, onFile, disabled, busy }: {
       <input
         type="file"
         accept="image/*"
-        capture="environment"
+        capture={CAPTURE}
         className="sr-only"
         disabled={disabled}
         onChange={e => {
@@ -309,22 +231,31 @@ function CameraButton({ label, onFile, disabled, busy }: {
   )
 }
 
+/** The last game, resumed after a reload. */
+function savedGame(): Game | null {
+  try {
+    const id = localStorage.getItem(GAME_KEY)
+    return id ? getGame(id) : null
+  } catch {
+    return null // storage blocked: just start fresh
+  }
+}
+
 export default function App() {
+  const [resumed] = useState(savedGame)
+  const [resumedView] = useState(() => resumed && viewFromLayout(resumed))
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
-  const [game, setGame] = useState<Game | null>(null)
-  const [view, setView] = useState<GameAnalyzeResponse | null>(null)
-  const [serverBalls, setServerBalls] = useState<Ball[] | null>(null) // the layout the backend has
+  const [game, setGame] = useState<Game | null>(resumed)
+  const [view, setView] = useState<GameAnalyzeResponse | null>(resumedView)
+  const [serverBalls, setServerBalls] = useState<Ball[] | null>(resumedView?.balls ?? null) // the layout the saved game has
   const [selected, setSelected] = useState(0)
   const [confirmed, setConfirmed] = useState(false)
   const [tool, setTool] = useState<Tool>('label')
   const [picking, setPicking] = useState<number | null>(null)
   const [history, setHistory] = useState<History>(EMPTY_HISTORY)
-  const [coach, setCoach] = useState<Coach>({ kind: 'idle' })
-  const [adviceCount, setAdviceCount] = useState(0) // new audio URL per piece of advice
-  const coachRequest = useRef(0) // bumped to drop advice for a layout that's since changed
   // Physics plan (spin and power) and the shot it's for: a stale one is simply not shown.
   const [plan, setPlan] = useState<{ shot: Shot; result: PlanResponse | null } | null>(null)
-  const [rosters, setRosters] = useState<Rosters>(null) // team mode; null = 1 vs 1
+  const [rosters, setRosters] = useState<Rosters>(() => resumed && loadRosters(resumed.id)) // team mode; null = 1 vs 1
   const [hideTestTools, setHideTestTools] = useState(testToolsHidden)
   // The photo just taken (new, or a retake of the latest): shown but not saved until confirmed
   const [pending, setPending] = useState<Pending | null>(null)
@@ -332,25 +263,13 @@ export default function App() {
   const [held, setHeld] = useState<{ gutter: GutterEntry[] | null; turn: 0 | 1 | null }>(NOTHING_HELD)
   const [placing, setPlacing] = useState<number | null>(null) // ball taken out of the gutter, to put on the table
 
+  const engine = useEngine()
   const busy = status.kind === 'loading'
   const devMode = game?.id === DEV_GAME_ID
 
-  // Resume the last game after a reload.
+  // Get the table reader ready while they set up, so the first photo doesn't wait for it.
   useEffect(() => {
-    let id: string | null = null
-    try {
-      id = localStorage.getItem(GAME_KEY)
-    } catch {
-      /* storage blocked: just start fresh */
-    }
-    if (id)
-      getGame(id)
-        .then(g => {
-          setGame(g)
-          setRosters(loadRosters(g.id))
-          loadView(viewFromLayout(g))
-        })
-        .catch(() => localStorage.removeItem(GAME_KEY))
+    offlineReady().then(startEngine)
   }, [])
 
   const player = game ? game.players[game.turn] : null
@@ -362,7 +281,7 @@ export default function App() {
     [view, player, confirmed],
   )
 
-  // Spin and power come from the physics engine (not Gemini), for whichever shot is selected.
+  // Spin and power come from the physics engine, for whichever shot is selected.
   const selectedShot = shots[selected]
   const shooterGroup = player?.group ?? null
   useEffect(() => {
@@ -393,9 +312,7 @@ export default function App() {
     return [g, ...path.slice(contact + 1)]
   }, [plan, selectedShot])
 
-  // Top shots, plus the coach's pick if it isn't one of them.
   const shown = shots.slice(0, SHOTS_SHOWN).map((_, i) => i)
-  if (selected >= SHOTS_SHOWN && shots[selected]) shown.push(selected)
 
   async function run<T>(what: string, fn: () => Promise<T>): Promise<T | undefined> {
     setStatus({ kind: 'loading', what })
@@ -404,16 +321,11 @@ export default function App() {
       setStatus({ kind: 'idle' })
       return out
     } catch (err) {
-      setStatus({ kind: 'error', message: errorMessage(err) })
+      setStatus({ kind: 'error', message: (err as Error).message })
     }
   }
 
-  function resetCoach() {
-    coachRequest.current++
-    setCoach({ kind: 'idle' })
-  }
-
-  // A fresh layout from the backend: back to editing it.
+  // A fresh layout from a photo or a fix: back to editing it.
   function loadView(next: GameAnalyzeResponse | null) {
     setView(next)
     setServerBalls(next?.balls ?? null)
@@ -424,11 +336,10 @@ export default function App() {
     setPending(null)
     setHeld(NOTHING_HELD)
     setSelected(0)
-    resetCoach()
   }
 
   async function start(names: [string, string], teams: Rosters) {
-    const g = await run('Starting…', () => createGame(names))
+    const g = await run('Starting…', async () => createGame(names))
     if (!g) return
     try {
       localStorage.setItem(GAME_KEY, g.id)
@@ -449,12 +360,12 @@ export default function App() {
     loadView({ ...structuredClone(MOCK_TABLE), missing: [], rejected: [], shot: null, game: g })
   }
 
-  // The gutter is the backend's record of what's pocketed: fixing it also takes a ball off
-  // the table, or puts one back. Unsaved layout edits are kept; the coach starts over.
+  // The gutter is the game's record of what's pocketed: fixing it also takes a ball off
+  // the table, or puts one back. Unsaved layout edits are kept.
   async function saveGutter(next: GutterEntry[], change?: TableChange) {
     if (!game || busy) return
     let saved: Ball[] | null = serverBalls && change ? changeTable(serverBalls, change) : serverBalls
-    // The test table has no backend, and a photo isn't saved until confirmed: both change it here only
+    // The test table is never saved, and a photo isn't saved until confirmed: both change it here only
     if (devMode || pending) {
       setGame(withGutter(game, next))
       if (pending) setHeld(h => ({ ...h, gutter: next }))
@@ -471,7 +382,6 @@ export default function App() {
     setServerBalls(saved)
     setHistory(EMPTY_HISTORY) // undo can't bring back a ball that's in the gutter now
     setConfirmed(false)
-    resetCoach()
   }
 
   function setWho(ball: number, by: 0 | 1 | null, member: string | null) {
@@ -503,13 +413,13 @@ export default function App() {
     else commit(changeTable(view.balls, { on: ball }))
   }
 
-  // Every photo after the first shows the result of the shot before it: the backend
+  // Every photo after the first shows the result of the shot before it: the game
   // works out what went in by comparing it with the previous photo. Nothing is saved until
   // the layout is confirmed, so a bad photo can be retaken as often as needed.
   async function handlePhoto(file: File, retake: boolean) {
     if (!game) return
     // While a photo is waiting, any new one redoes it. Otherwise the shot selected on screen
-    // is the one they went for: it's what counts as made or missed in their stats. A retake
+    // is the one they went for: it's what counts as made or missed. A retake
     // of a saved photo keeps what was sent with it.
     const shot = shots[selected]
     const next: Pending = pending ?? {
@@ -518,8 +428,8 @@ export default function App() {
         ? { target: shot.targetId, pocket: shot.pocket, kind: shot.kind, cut_angle: shot.cutAngle }
         : null,
     }
-    const res = await run('Reading the table…', async () =>
-      analyzeGamePhoto(game.id, await resizeImage(file), { intended: next.intended, retake: next.mode === 'replace' }),
+    const res = await run(READING, async () =>
+      analyzeGamePhoto(game.id, await photoPixels(file), { intended: next.intended, retake: next.mode === 'replace' }),
     )
     if (!res) return
     setGame(res.game) // what the game would be with this photo; the saved one hasn't changed
@@ -539,9 +449,8 @@ export default function App() {
       if (!g) return
       setGame(g)
     }
-    // Shots and advice were for the other player
+    // Shots were for the other player
     setConfirmed(false)
-    resetCoach()
   }
 
   function onBallTap(index: number) {
@@ -560,7 +469,6 @@ export default function App() {
     if (!view) return
     setView({ ...view, balls })
     setConfirmed(false)
-    resetCoach()
   }
 
   function commit(balls: Ball[]) {
@@ -585,11 +493,10 @@ export default function App() {
 
   function editLayout() {
     setConfirmed(false)
-    resetCoach()
   }
 
-  // Send any fixes to the backend (it replays the photo, so the detected shot, groups and
-  // turn can change), then show shots and ask the coach. Shots never wait on the coach.
+  // Save any fixes (the photo is replayed, so the detected shot, groups and turn can
+  // change), then show shots.
   async function confirmLayout() {
     if (!view || !game || busy) return
     if (view.balls.some(b => b.type !== 'cue' && b.id == null)) {
@@ -600,8 +507,6 @@ export default function App() {
       setStatus({ kind: 'error', message: 'Every ball has to be on the table or in the gutter. Tap the ones marked ? to say where.' })
       return
     }
-    let current = view
-    let currentGame = game
     // A photo is only saved now: as the next one, or in place of the latest (a retake)
     if (!devMode && (view.balls !== serverBalls || pending)) {
       const res = await run('Saving your fixes…', async () => {
@@ -612,8 +517,6 @@ export default function App() {
         return out
       })
       if (!res) return
-      current = res
-      currentGame = res.game
       setGame(res.game)
       setView(res)
       setServerBalls(res.balls)
@@ -623,28 +526,6 @@ export default function App() {
     setStatus({ kind: 'idle' })
     setConfirmed(true)
     setSelected(0)
-    if (currentGame.winner != null) return
-
-    // The coach needs a saved game and Gemini; the test table has neither.
-    if (devMode) {
-      setCoach({ kind: 'off' })
-      return
-    }
-    const group = currentGame.players[currentGame.turn].group
-    const found = findShots(current.balls, current.table, current.ball_radius, group)
-    const request = ++coachRequest.current
-    setCoach({ kind: 'loading' })
-    try {
-      const advice = await getAdvice(currentGame.id, toCandidates(found))
-      if (request !== coachRequest.current) return
-      setCoach({ kind: 'done', advice })
-      setAdviceCount(n => n + 1)
-      setSelected(advice.shot_index >= 0 && advice.shot_index < found.length ? advice.shot_index : 0)
-    } catch {
-      if (request !== coachRequest.current) return
-      setCoach({ kind: 'error' })
-      setSelected(0)
-    }
   }
 
   function showTestTools(show: boolean) {
@@ -676,6 +557,8 @@ export default function App() {
         ? guideFromPlan(plan.result)
         : placeholderGuide('Physics unavailable')
   const photoCount = game?.layout?.n ?? 0
+  const reading = busy && status.what === READING
+  const readingLabel = engine.kind === 'loading' ? `Getting ready… ${Math.round(engine.fraction * 100)}%` : READING
   const needsCheck = view ? view.balls.filter(ball => ball.confidence < 0.7).length : 0
   const sunk = new Set(
     Object.entries(game?.balls ?? {}).filter(([b, s]) => s === 'sunk' && b !== 'cue').map(([b]) => Number(b)),
@@ -715,7 +598,7 @@ export default function App() {
 
         {!game && <Setup onStart={start} busy={busy} />}
 
-        {/* Dev only: skip the camera + backend and load a canned table */}
+        {/* Dev only: skip the camera and load a canned table */}
         {import.meta.env.DEV && !hideTestTools && (
           <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
             {[false, true].map(teams => (
@@ -782,8 +665,8 @@ export default function App() {
                 disabled={busy}
                 onFile={f => handlePhoto(f, false)}
                 label={
-                  busy && status.what === 'Reading the table…'
-                    ? status.what
+                  reading
+                    ? readingLabel
                     : photoCount === 0 ? 'Photo of the table' : `Photo after ${shooterName}’s shot`
                 }
               />
@@ -792,7 +675,7 @@ export default function App() {
               <PhotoButton
                 disabled={busy}
                 onFile={f => handlePhoto(f, true)}
-                label={busy && pending && status.what === 'Reading the table…' ? status.what : pending ? 'Retake photo' : 'Retake the last photo'}
+                label={reading && pending ? readingLabel : pending ? 'Retake photo' : 'Retake the last photo'}
               />
             )}
 
@@ -886,7 +769,7 @@ export default function App() {
                       />
                     )}
                     <CameraButton
-                      busy={busy && status.what === 'Reading the table…'}
+                      busy={reading}
                       disabled={busy}
                       label={photoCount === 0 ? 'Photo of the table' : `Photo after ${shooterName}’s shot`}
                       onFile={f => handlePhoto(f, false)}
@@ -923,26 +806,6 @@ export default function App() {
                       Edit layout
                     </button>
 
-                    {coach.kind === 'loading' && <CoachThinking />}
-                    {coach.kind === 'error' && (
-                      <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 shadow-sm dark:bg-stone-900 dark:text-stone-400">
-                        Coach unavailable. Here’s the easiest shot.
-                      </p>
-                    )}
-                    {coach.kind === 'off' && (
-                      <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 shadow-sm dark:bg-stone-900 dark:text-stone-400">
-                        The coach is off for the test table: it needs a real game. Spin and power still come from physics.
-                      </p>
-                    )}
-                    {coach.kind === 'done' && (
-                      <CoachCard
-                        key={adviceCount}
-                        advice={coach.advice}
-                        shot={coach.advice.shot_index >= 0 ? shots[coach.advice.shot_index] : undefined}
-                        audioUrl={adviceAudioUrl(game.id, adviceCount)}
-                      />
-                    )}
-
                     {shots.length === 0 ? (
                       <p className="rounded-xl bg-white px-4 py-3 text-sm text-stone-600 dark:bg-stone-900 dark:text-stone-400">
                         No clear shot at a legal ball.
@@ -966,7 +829,6 @@ export default function App() {
                               >
                                 <span className="block font-semibold">
                                   Ball {shot.targetId ?? '?'} {'->'} {pocketName(shot.pocket)}
-                                  {coach.kind === 'done' && coach.advice.shot_index === i && ' · coach’s pick'}
                                 </span>
                                 <span className={`mt-0.5 block text-sm ${active ? 'text-emerald-100' : 'text-stone-600 dark:text-stone-400'}`}>
                                   {shot.kind} · {shot.cutAngle}° · {difficultyLabel(shot.difficulty)}
